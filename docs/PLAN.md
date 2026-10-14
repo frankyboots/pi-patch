@@ -247,6 +247,19 @@ Implemented so far:
       `_check_file_staleness` verbatim naming the model's own path spelling
       (`errors.ts`; no tool name, so ledger #10 does not apply).
 
+      **Test coverage: 13 tests** — 12 in `describe("staleness: read-time version
+      capture + edit-time warning …")` (never-read/unchanged silence, warn-and-write,
+      drift on a miss, self-edit quietness, the tuple's delete/recreate and
+      `utimes` cases, unstattable, cap eviction, V4A per-header) + 1 on the
+      `src/index.ts` `tool_result` wiring. 324 total.
+
+      **Manual, against core's real tools** (fresh `pi -p` sessions loading the
+      working tree, since this session had loaded the pre-change extension):
+      `read` → external `touch -d 2020-01-01` → `patch` wrote **and** appended
+      hermes' warning verbatim; a core `edit` followed by a `patch` of the same file
+      stayed silent, i.e. the write refresh works end to end and costs no false
+      nudge.
+
 ## Build plan (exact-port tiers)
 
 Tiers are ordered by dependency, not by value: the strategy chain (Tier 1) is the matching
