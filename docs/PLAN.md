@@ -47,6 +47,26 @@ reschema):
       error now offers the flag. The hermes `TestReplaceAll` corpus is ported;
       the per-edit flag stands in for the flat schema one until Tier 2 #5
       reschemas.
+- [x] Tier 1 #4: replacement shaping completed (`src/shaping.ts`), wire-for-wire
+      with hermes' orchestrator tail: `_maybe_unescape_new_string` (conditional
+      `\t`/`\r` unescape over the matched regions — all strategies including
+      exact, per TestEscapeNormalizedNewString/issue #33733; `\n` excluded),
+      `_unicode_edit_plan` + `_preserve_unicode_in_replacement` (unicode_normalized
+      matches apply only the old→new opcodes onto each region's ORIGINAL text, so
+      the file's em-dashes/smart quotes survive; per-region so replace_all keeps
+      each occurrence's own typography), `_reindent_replacement` completed (first
+      MEANINGFUL line anchoring, ` \t`-only strip, shallower lines anchor to the
+      file base), and `_apply_replacements` (end-to-start splice, per-region
+      shaping via `shapeReplacement`). The opcode plan is computed by a verbatim
+      port of `difflib.SequenceMatcher` (`SequenceMatcher` class, CPython 3.12
+      reference: `__chain_b` autojunk, `find_longest_match` tie-breaks,
+      `get_matching_blocks` collapse, `get_opcodes`) — differential fuzz (2 seeds
+      × 4000 preserve + 2000 unescape cases vs the real hermes module) showed
+      the `diff`-package stand-in
+      produces different edit scripts whose splice output differs; ratios keep
+      the blessed stand-in, opcodes must match SequenceMatcher exactly. The
+      TestUnicodeNormalized, TestUnicodeSpaceAndMinusNormalized, TestReplaceAll
+      unicode, and TestEscapeNormalizedNewString corpora are ported.
 - [x] Tier 1 #3: escape-drift guards ported (`src/escape-drift.ts` —
       `_detect_escape_drift` + `_detect_newline_literal_drift` +
       `_detect_backslash_doubling` verbatim) and wired where hermes runs them:
@@ -81,8 +101,11 @@ though V4A is now in scope.
       self-overlap guard.)
 - [x] 3. Escape-drift guards on every non-exact match (newline-literal, quote-suspect,
       backslash-doubling) before anything is written.
-- [ ] 4. Replacement shaping completion: `_reindent_replacement` (done), unicode-preserving
-      opcode application, conditional `\t`/`\r` unescape of `new_string`.
+- [x] 4. Replacement shaping completion: `_reindent_replacement` (completed to hermes
+      verbatim), unicode-preserving opcode application, conditional `\t`/`\r` unescape
+      of `new_string` (exact included). Opcodes come from a verbatim
+      `difflib.SequenceMatcher` port (see the Tier 1 #4 status entry — the
+      diff-package stand-in is ratio-only).
 
 ### Tier 2 — replace-mode surface & recovery parity
 
@@ -140,7 +163,7 @@ argument normalization. Everything else follows hermes.
 |---|---|---|
 | Strategy chain core | ~450 (`fuzzy_match.py` incl. span mapping) | Moderate — the span-mapping helpers (`_map_normalized_positions`, `_build_orig_to_norm_map`) are subtle; port with tests, don't reimplement from the table |
 | V4A parser + appliers | ~450 (`patch_parser.py`) | Moderate — format parsing, validation pass, hint-window retry; port verbatim with `tests/tools/test_patch_parser.py` as acceptance |
-| `SequenceMatcher` equivalent | — | No new dependency needed: pi's `edit-diff.js` already imports the `diff` npm package, and `difflib.ratio` (`2·M/T`) is computable from `Diff.diffChars` opcodes (`M` = total matched length). Similarity thresholds must still be re-validated against the same fixtures |
+| `SequenceMatcher` equivalent | — | Split verdict: `difflib.ratio` (`2·M/T`) is computable from `Diff.diffChars` opcodes (stand-in, blessed for the similarity thresholds — re-validated against the same fixtures), but `get_opcodes()` needed a verbatim CPython port (Tier 1 #4): the greedy jsdiff script is a different edit script, and the unicode-preserving splice writes different text under it |
 | Escape-drift guards | ~120 | Low — pure string logic |
 | Recovery UX (hints, locations, escalation) | ~150 + failure/read trackers | Low-Medium; trackers are session-scoped state in an extension (fine), pi has no built-in persistence for these |
 | Already-applied detection | ~15 | Trivial |

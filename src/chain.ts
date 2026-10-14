@@ -26,8 +26,9 @@
  * single-replacement semantics by default, `replaceAll` over every match of
  * the winning strategy (Tier 1 #2), and the escape-drift guards on every
  * non-exact match (Tier 1 #3) — hermes runs them inside the orchestrator,
- * before anything is written; the unicode-preserving replacement opcodes
- * (Tier 1 #4) are the remaining piece.
+ * before anything is written. The orchestrator tail (conditional \t/\r
+ * unescape, unicode-preserving opcodes, reindent, splice) lives in
+ * `shaping.ts` + the tool layer (Tier 1 #4).
  */
 import { buildLineIndex, lineAt, similarity, type LineIndex } from "./text.js";
 import { detectEscapeDrift, type EscapeDrift } from "./escape-drift.js";

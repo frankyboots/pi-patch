@@ -26,7 +26,7 @@ import {
 } from "./text.js";
 import { runChain, type ChainFailure, type ChainMatch, type MatchLocation } from "./chain.js";
 import type { Span } from "./span-map.js";
-import { reindentReplacement } from "./shaping.js";
+import { maybeUnescapeNewString, shapeReplacement, unicodeEditPlan } from "./shaping.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
 import {
 	alreadyAppliedMessage,
@@ -305,17 +305,36 @@ function applyPatchEdits(
 		}
 	}
 
-	// Splice in reverse order; shape non-exact replacements onto EACH region's
-	// indent — occurrences of one replaceAll edit can sit at different depths.
+	// Per-edit shaping inputs (hermes orchestrator, Tier 1 #4): effective_new =
+	// conditional \t/\r unescape over THIS edit's matched regions (all
+	// strategies, exact included — issue #33733), plus the unicode opcode plan
+	// for unicode_normalized matches. Computed once per edit; each region is
+	// shaped in the splice (preserve-unicode -> reindent).
+	const shapedEdits = matches.map((m, i) => {
+		const edit = edits[i];
+		if (!m) return undefined;
+		const effectiveNew = maybeUnescapeNewString(edit.newText, normalizedContent, m.spans);
+		const unicodePlan =
+			m.strategy === "unicode_normalized" ? unicodeEditPlan(edit.oldText, effectiveNew) : undefined;
+		return { effectiveNew, unicodePlan };
+	});
+
+	// Splice in reverse order; shape non-exact replacements onto EACH region —
+	// occurrences of one replaceAll edit can sit at different depths and carry
+	// different typographic characters (unicode plan is per region).
 	const replacements = ordered
 		.slice()
 		.reverse()
 		.map(({ span, editIndex, exact }) => {
 			const edit = edits[editIndex];
-			const matchedText = normalizedContent.slice(span.start, span.end);
+			const shaped = shapedEdits[editIndex]!;
+			const region = normalizedContent.slice(span.start, span.end);
 			const newText = exact
-				? edit.newText
-				: reindentReplacement(edit.oldText, edit.newText, matchedText);
+				? shaped.effectiveNew
+				: shapeReplacement(region, shaped.effectiveNew, {
+						oldText: edit.oldText,
+						unicodePlan: shaped.unicodePlan,
+					});
 			return { start: span.start, end: span.end, newText };
 		});
 	let newContent = normalizedContent;

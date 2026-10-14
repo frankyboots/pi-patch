@@ -27,7 +27,14 @@ import {
 	windowSpans,
 	type Span,
 } from "../src/span-map.js";
-import { reindentReplacement } from "../src/shaping.js";
+import {
+	applyReplacements,
+	maybeUnescapeNewString,
+	preserveUnicodeInReplacement,
+	reindentReplacement,
+	SequenceMatcher,
+	unicodeEditPlan,
+} from "../src/shaping.js";
 import { detectEscapeDrift } from "../src/escape-drift.js";
 import { escapeDriftErrorMessage } from "../src/errors.js";
 import { createPatchToolDefinition, prepareEditArguments } from "../src/tool.js";
@@ -97,10 +104,11 @@ describe("chain: strategy selection", () => {
 // ── hermes corpus port (tests/tools/test_fuzzy_match.py) ─────────────────
 //
 // Ported per docs/PLAN.md's validation bar. `fuzzyReplace` mirrors hermes'
-// fuzzy_find_and_replace: chain (replaceAll included, Tier 1 #2) + escape-drift
-// guards on non-exact matches (Tier 1 #3) + splice with reindent shaping onto
-// EACH region. Unicode-preserving replacement opcodes (Tier 1 #4) land with
-// that step — corpus cases needing them are ported there.
+// fuzzy_find_and_replace end to end: chain (replaceAll included, Tier 1 #2) +
+// escape-drift guards on the RAW new_string of non-exact matches (Tier 1 #3) +
+// the full replacement shaping (Tier 1 #4): conditional \t/\r unescape,
+// unicode-preserving opcodes, and reindent onto EACH region — hermes'
+// _apply_replacements, spliced end-to-start.
 
 function fuzzyReplace(
 	content: string,
@@ -123,16 +131,18 @@ function fuzzyReplace(
 							: "Could not find a match for old_string in the file",
 		};
 	}
-	// hermes _apply_replacements: splice end-to-start; non-exact matches are
-	// re-indented onto each region's own indent (regions slice the ORIGINAL
-	// content — offsets stay valid because spans never overlap).
-	let out = content;
-	for (const span of [...r.match.spans].reverse()) {
-		const replacement = r.match.exact
-			? newText
-			: reindentReplacement(oldText, newText, content.slice(span.start, span.end));
-		out = out.slice(0, span.start) + replacement + out.slice(span.end);
-	}
+	// hermes orchestrator tail: effective_new = conditional \t/\r unescape over
+	// the matched regions (ALL strategies — issue #33733), then
+	// _apply_replacements: unicode plan (unicode_normalized) + reindent per
+	// region, spliced end-to-start (offsets stay valid — spans never overlap).
+	// Exact matches keep the (unescaped) bytes verbatim.
+	const effectiveNew = maybeUnescapeNewString(newText, content, r.match.spans);
+	const unicodePlan =
+		r.match.strategy === "unicode_normalized" ? unicodeEditPlan(oldText, effectiveNew) : undefined;
+	const out = applyReplacements(content, r.match.spans, effectiveNew, {
+		oldText: r.match.exact ? undefined : oldText,
+		unicodePlan,
+	});
 	return { ok: true, out, count: r.match.spans.length, strategy: r.match.strategy };
 }
 
@@ -215,11 +225,78 @@ describe("corpus: TestUnicodeNormalized (hermes)", () => {
 		if (r.ok) expect(r.out).toContain("return value or fallback");
 	});
 
-	// The remaining TestUnicodeNormalized/SpaceAndMinus cases (ellipsis, mixed
-	// multiline, expansion boundaries, unicode minus, ideographic space) assert
-	// the FILE's typographic characters survive the replacement — that is the
-	// unicode-preserving opcode application, landing with Tier 1 #4. Until then,
-	// pin the matching side: right strategy, right ORIGINAL bytes matched.
+	// Tier 1 #4: the remaining TestUnicodeNormalized/SpaceAndMinus cases assert
+	// the FILE's typographic characters survive the replacement — the
+	// unicode-preserving opcode application.
+	it("test_ellipsis_preserved", () => {
+		const r = fuzzyReplace("Wait for it\u2026and done", "Wait for it...and done", "Wait for it...then done");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+		if (r.ok) expect(r.out).toBe("Wait for it\u2026then done");
+	});
+
+	it("test_mixed_unicode_multiline", () => {
+		const r = fuzzyReplace(
+			"Line 1 \u2014 with dash\nLine 2 \u201cquoted\u201d text\nLine 3 plain",
+			"Line 1 -- with dash\nLine 2 \"quoted\" text\nLine 3 plain",
+			"Line 1 -- with dash\nLine 2 \"quoted\" text\nLine 3 changed",
+		);
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+		if (r.ok) {
+			expect(r.out).toBe("Line 1 \u2014 with dash\nLine 2 \u201cquoted\u201d text\nLine 3 changed");
+		}
+	});
+
+	it("test_equal_boundary_inside_expansion_keeps_region_text", () => {
+		// An edit boundary falling inside a multi-char expansion (em-dash ->
+		// '--') must snap to the expansion, not copy text from the region start
+		// (the old fallback spliced the whole region text after every edit).
+		const r = fuzzyReplace("value = x\u2014y\n", "value = x--y", "value = x-@-y");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+		if (r.ok) expect(r.out).toBe("value = x\u2014@\u2014y\n");
+
+		// Same boundary class for a 3-char expansion (ellipsis -> '...').
+		const r2 = fuzzyReplace("a\u2026b\n", "a...b", "a..X.b");
+		expect(r2).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+		if (r2.ok) expect(r2.out).toBe("a\u2026X\u2026b\n");
+	});
+
+	describe("corpus: TestUnicodeSpaceAndMinusNormalized (hermes)", () => {
+		it("test_unicode_minus_matched_and_preserved", () => {
+			const r = fuzzyReplace(
+				"offset = value \u2212 1\nprint(offset)\n",
+				"offset = value - 1",
+				"offset = delta - 1",
+			);
+			expect(r).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+			if (r.ok) expect(r.out).toContain("delta \u2212 1");
+		});
+
+		it("test_ideographic_space_cjk_line", () => {
+			const r = fuzzyReplace(
+				"\u6a19\u984c\u3000\u7b2c\u4e00\u7ae0\nbody text\n",
+				"\u6a19\u984c \u7b2c\u4e00\u7ae0",
+				"\u6a19\u984c \u7b2c\u4e8c\u7ae0",
+			);
+			expect(r).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+			if (r.ok) expect(r.out).toContain("\u6a19\u984c\u3000\u7b2c\u4e8c\u7ae0");
+		});
+	});
+
+	it("TestReplaceAll.test_unicode_normalized_preserves_each_matches_own_unicode", () => {
+		// Each normalized match keeps ITS typographic characters; hermes once
+		// concatenated the regions, which spliced both matches' text into every
+		// replacement.
+		const r = fuzzyReplace(
+			"Price \u2018old\u2019\u2014ready\nPrice 'old'\u2014ready\n",
+			"Price 'old'--ready",
+			"Price 'new'--ready",
+			{ replaceAll: true },
+		);
+		expect(r).toMatchObject({ ok: true, count: 2, strategy: "unicode_normalized" });
+		if (r.ok) expect(r.out).toBe("Price \u2018new\u2019\u2014ready\nPrice 'new'\u2014ready\n");
+	});
+
+	// Matching side still pinned: right strategy, right ORIGINAL bytes matched.
 	it("matches at unicode_normalized with spans into the original bytes", () => {
 		const cases: [string, string][] = [
 			["Wait for it\u2026and done", "Wait for it...and done"],
@@ -264,30 +341,80 @@ describe("corpus: TestBlockAnchorThreshold (hermes)", () => {
 });
 
 describe("corpus: escape_normalized (hermes)", () => {
-	it("literal \\t in the pattern matches the file's real tab", () => {
-		// Matching side of TestEscapeNormalizedNewString.test_tab_in_new_string_
-		// unescaped_under_escape_normalized; the new_string unescape lands in #4.
+	// Tier 1 #4: the new_string unescape corpus (hermes
+	// TestEscapeNormalizedNewString — issue #33733). fuzzyReplace mirrors
+	// hermes' orchestrator: drift guards on the RAW new_string, then the
+	// conditional \t/\r unescape over the matched regions (exact included),
+	// then the splice.
+	it("TestEscapeNormalizedNewString: tab unescaped under escape_normalized", () => {
 		const content = "def hello():\n\tprint(\"before\")\n";
-		const r = runChain(content, "def hello():\n\\tprint(\"before\")\n");
-		expect(r.ok).toBe(true);
+		const r = fuzzyReplace(content, "def hello():\n\\tprint(\"before\")\n", "def hello():\n\\tprint(\"after\")\n");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "escape_normalized" });
 		if (r.ok) {
-			expect(r.match.strategy).toBe("escape_normalized");
-			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe(content);
+			expect(r.out).toContain("\tprint(\"after\")");
+			expect(r.out).not.toContain("\\t");
 		}
 	});
 
-	it("literal \\r in the pattern matches the file's real CR (chain level, raw bytes)", () => {
-		// Matching side of test_carriage_return_in_new_string_unescaped. The
-		// TOOL layer pre-normalizes LF (deviations ledger #2), so a literal-\r
-		// anchor on a CRLF file falls through to the similarity rungs there;
-		// at chain level the strategy behaves exactly like hermes.
-		const content = "line1\r\nline2\r\n";
-		const r = runChain(content, "line1\\r\nline2\\r\n");
-		expect(r.ok).toBe(true);
+	it("TestEscapeNormalizedNewString: tab unescaped under exact (issue headline)", () => {
+		// File has real tab, old_string has real tab too (matches via `exact`),
+		// but new_string still arrives with literal \t.
+		const content = "def hello():\n\tprint(\"before\")\n";
+		const r = fuzzyReplace(content, "\tprint(\"before\")", "\\tprint(\"after\")");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "exact" });
 		if (r.ok) {
-			expect(r.match.strategy).toBe("escape_normalized");
-			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe(content);
+			expect(r.out).toContain("\tprint(\"after\")");
+			expect(r.out).not.toContain("\\t");
 		}
+	});
+
+	it("TestEscapeNormalizedNewString: carriage return unescaped (chain level, raw bytes)", () => {
+		// The TOOL layer pre-normalizes LF (deviations ledger #2), so a
+		// literal-\r anchor on a CRLF file falls through to the similarity
+		// rungs there; at chain level the strategy behaves exactly like hermes.
+		const content = "line1\r\nline2\r\n";
+		const r = fuzzyReplace(content, "line1\\r\nline2\\r\n", "replaced\\r\n");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "escape_normalized" });
+		if (r.ok) expect(r.out).toContain("replaced\r\n");
+	});
+
+	it("TestEscapeNormalizedNewString: \\n is NOT unescaped", () => {
+		// \n serializes correctly through JSON; unescaping it would corrupt
+		// source-code escape sequences far more often than help.
+		const r = fuzzyReplace("line1\nline2\n", "line1\nline2", "alpha\\nbeta");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "exact" });
+		if (r.ok) {
+			expect(r.out).toContain("alpha\\nbeta");
+			expect(r.out).not.toContain("alpha\nbeta");
+		}
+	});
+
+	it("TestEscapeNormalizedNewString: mixed tab+newline, only tab unescaped", () => {
+		const r = fuzzyReplace("def foo():\n\tpass\n", "def foo():\n\tpass\n", "def bar():\\n\\treturn 1\\n");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "exact" });
+		if (r.ok) {
+			expect(r.out).toContain("\treturn 1");
+			expect(r.out).not.toContain("\\t");
+			expect(r.out).toContain("\\n");
+		}
+	});
+
+	it("TestEscapeNormalizedNewString: literal \\t preserved when the file has none", () => {
+		// The file genuinely uses a backslash-t sequence (a Python source line
+		// sep = "\t") — no tab byte may be injected.
+		const content = "sep = \"\\t\"\n";
+		const r = fuzzyReplace(content, "sep = \"\\t\"\n", "sep = \"\\tab\"\n");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "exact" });
+		if (r.ok) {
+			expect(r.out).toContain("sep = \"\\tab\"");
+			expect(r.out).not.toContain("\t");
+		}
+	});
+
+	it("TestEscapeNormalizedNewString: no escape sequences passthrough", () => {
+		const r = fuzzyReplace("def foo():\n    return 1\n", "def foo():\n    return 1\n", "def foo():\n    return 2\n");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "exact" });
+		if (r.ok) expect(r.out).toContain("return 2");
 	});
 
 	it("literal \\n in the pattern matches the file's real newline", () => {
@@ -608,7 +735,7 @@ describe("corpus: TestReplaceAll (hermes)", () => {
 	});
 });
 
-describe("shaping: reindent replacement", () => {
+describe("shaping: reindent replacement (hermes _reindent_replacement)", () => {
 	it("re-anchors a dedented replacement onto the file's indent", () => {
 		const oldText = "return 1;";
 		const newText = "return 2;";
@@ -624,8 +751,119 @@ describe("shaping: reindent replacement", () => {
 		expect(out).toBe("    if (x) {\n    return 2;\n    }");
 	});
 
-	it("leaves exact matches alone (patIndent === fileIndent)", () => {
+	it("anchors on the first MEANINGFUL line, not the first line", () => {
+		// hermes _first_meaningful_line: a leading blank line must not make
+		// the base indent "".
+		const out = reindentReplacement("\n\treturn 1;", "\treturn 2;", "            return 1;");
+		expect(out).toBe("            return 2;");
+	});
+
+	it("anchors shallower lines to the file base (else branch)", () => {
+		// oldText's base is a tab; "  shallow()" uses spaces — its indent does
+		// not start with the old base, so it anchors to the file base instead
+		// of being spliced with a foreign prefix.
+		const out = reindentReplacement("\tdeep();", "\tdeep();\n  shallow();", "        deep();");
+		expect(out).toBe("        deep();\n        shallow();");
+	});
+
+	it("strips only spaces and tabs when measuring indentation", () => {
+		// hermes _leading_whitespace lstrips " \t" — \f/\v are not indentation,
+		// so the \f survives as part of the line body.
+		const out = reindentReplacement("\freturn 1;", "\freturn 2;", "\treturn 1;");
+		expect(out).toBe("\t\freturn 2;");
+	});
+
+	it("returns empty newText as-is; leaves matching indents alone", () => {
+		expect(reindentReplacement("old", "", "\told")).toBe("");
 		expect(reindentReplacement("a", "b", "a")).toBe("b");
+	});
+});
+
+describe("shaping: conditional \\t/\\r unescape (hermes _maybe_unescape_new_string)", () => {
+	it("is a no-op without \\t or \\r literals", () => {
+		expect(maybeUnescapeNewString("a\nb", "\t\r", [{ start: 0, end: 2 }])).toBe("a\nb");
+	});
+
+	it("unescapes \\t only when a matched region contains the real tab", () => {
+		expect(maybeUnescapeNewString("a\\tb", "x\ty", [{ start: 0, end: 3 }])).toBe("a\tb");
+		expect(maybeUnescapeNewString("a\\tb", "xty", [{ start: 0, end: 3 }])).toBe("a\\tb");
+	});
+
+	it("unescapes \\r only when a matched region contains the real CR", () => {
+		expect(maybeUnescapeNewString("a\\rb", "x\ry", [{ start: 0, end: 3 }])).toBe("a\rb");
+		expect(maybeUnescapeNewString("a\\rb", "xry", [{ start: 0, end: 3 }])).toBe("a\\rb");
+	});
+
+	it("never touches \\n literals (would mangle source escape literals)", () => {
+		expect(maybeUnescapeNewString("a\\nb", "x\ny", [{ start: 0, end: 3 }])).toBe("a\\nb");
+	});
+
+	it("scans every matched region (replace_all)", () => {
+		const spans: Span[] = [
+			{ start: 0, end: 3 },
+			{ start: 4, end: 7 },
+		];
+		expect(maybeUnescapeNewString("x\\ty", "foo\n\tbar", spans)).toBe("x\ty");
+	});
+});
+
+describe("shaping: unicode-preserving opcodes (hermes _unicode_edit_plan/_preserve_unicode_in_replacement)", () => {
+	it("SequenceMatcher.getOpcodes mirrors difflib (CPython doctests)", () => {
+		expect(new SequenceMatcher("abc", "abc").getOpcodes()).toEqual([["equal", 0, 3, 0, 3]]);
+		expect(new SequenceMatcher("aXc", "aYc").getOpcodes()).toEqual([
+			["equal", 0, 1, 0, 1],
+			["replace", 1, 2, 1, 2],
+			["equal", 2, 3, 2, 3],
+		]);
+		expect(new SequenceMatcher("ab", "b").getOpcodes()).toEqual([
+			["delete", 0, 1, 0, 0],
+			["equal", 1, 2, 0, 1],
+		]);
+		// difflib's get_opcodes doctest (qabxcd -> abycdf).
+		expect(new SequenceMatcher("qabxcd", "abycdf").getOpcodes()).toEqual([
+			["delete", 0, 1, 0, 0],
+			["equal", 1, 3, 0, 2],
+			["replace", 3, 4, 2, 3],
+			["equal", 4, 6, 3, 5],
+			["insert", 6, 6, 5, 6],
+		]);
+		// find_longest_match doctest: prefers the EARLIEST maximal block in a,
+		// then the earliest in b — " abcd" vs "abcd abcd" matches at a[0:5].
+		expect(new SequenceMatcher(" abcd", "abcd abcd").getMatchingBlocks()).toEqual([
+			{ a: 0, b: 4, size: 5 },
+			{ a: 5, b: 9, size: 0 },
+			]);
+	});
+
+	it("keeps the region's typography for equal blocks (expansion boundary included)", () => {
+		const plan = unicodeEditPlan("value = x--y", "value = x-@-y");
+		expect(preserveUnicodeInReplacement("value = x\u2014y", "value = x-@-y", plan)).toBe(
+			"value = x\u2014@\u2014y",
+		);
+	});
+
+	it("falls back to newText when the region doesn't normalize to the plan's normOld", () => {
+		const plan = unicodeEditPlan("value = x--y", "value = x-@-y");
+		expect(preserveUnicodeInReplacement("value = x--y (different)", "R", plan)).toBe("R");
+	});
+});
+
+describe("shaping: applyReplacements (hermes _apply_replacements)", () => {
+	it("shapes each region and splices end-to-start (offsets stay valid)", () => {
+		const out = applyReplacements(
+			"    a = 1\n    b = 2\n",
+			[
+				{ start: 0, end: 9 },
+				{ start: 10, end: 19 },
+			],
+			"a = 1\n\nb = 99",
+			{ oldText: "a = 1\nb = 2" },
+		);
+		expect(out).toBe("    a = 1\n\n    b = 99\n    a = 1\n\n    b = 99\n");
+	});
+
+	it("keeps the bytes when oldText is not given (exact match)", () => {
+		expect(applyReplacements("a\tb", [{ start: 0, end: 3 }], "a\\tb")).toBe("a\\tb");
 	});
 });
 
@@ -707,6 +945,26 @@ describe("tool: execute against real files", () => {
 		expect(text).toContain("Successfully replaced 1 block(s)");
 		expect(text).toContain("---"); // unified patch in model-facing content
 		expect(res.details?.firstChangedLine).toBe(2);
+	});
+
+	it("unicode_normalized edit keeps the file's typographic characters on disk", async () => {
+		const { dir, file, name } = await tmpFile("Wait for it\u2026and done\n");
+		await run(
+			{ path: name, edits: [{ oldText: "Wait for it...and done", newText: "Wait for it...then done" }] },
+			dir,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe("Wait for it\u2026then done\n");
+	});
+
+	it("exact edit unescapes literal \\t in newText when the file has real tabs (issue #33733)", async () => {
+		const { dir, file, name } = await tmpFile("def hello():\n\tprint(\"before\")\n");
+		await run(
+			{ path: name, edits: [{ oldText: "\tprint(\"before\")", newText: "\\tprint(\"after\")" }] },
+			dir,
+		);
+		const after = await fs.readFile(file, "utf-8");
+		expect(after).toBe("def hello():\n\tprint(\"after\")\n");
+		expect(after).not.toContain("\\t");
 	});
 
 	it("applies multiple disjoint edits all-or-nothing against the same snapshot", async () => {

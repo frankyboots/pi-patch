@@ -28,7 +28,7 @@ dual-mode surface — onto pi.
 | Ambiguous error | "Found N occurrences" | `Found N matches` + up to 5 `L<line>: snippet` locations |
 | Already applied | error-shaped | **success-shaped no-op** ("do not re-send this patch") |
 | Diff | UI only | also in model-facing content (self-check loop) |
-| Fuzzy replacement | rewrites from normalized base | reindents the replacement onto the file's indent, file bytes kept |
+| Fuzzy replacement | rewrites from normalized base | reindents onto the file's indent; unicode matches keep the file's typographic characters; conditional `\t`/`\r` unescape (exact included) |
 | Schema text | "must match exactly" | "tolerates minor whitespace/indentation drift" (per the analysis, the promise matters) |
 
 Kept from pi (each a row in the PLAN.md deviations ledger): LF pre-normalization + BOM/CRLF
@@ -98,7 +98,8 @@ Layout:
 src/index.ts     extension entry — registers `patch` + renderers
 src/tool.ts      tool definition: pi edit skeleton + chain + teaching errors
 src/chain.ts     ordered strategy chain (spans into LF-normalized content)
-src/shaping.ts   reindent-replacement (port of hermes _reindent_replacement)
+src/shaping.ts   replacement shaping: conditional \t/\r unescape, unicode-preserving
+                 opcodes (verbatim difflib.SequenceMatcher port), reindent, splice
 src/errors.ts    teaching error builders (did-you-mean, whitespace viz)
 src/diff-utils.ts display diff + unified patch (pi-compatible formats)
 src/render.ts    TUI call/result renderers with live preview via our engine

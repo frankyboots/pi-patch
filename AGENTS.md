@@ -51,7 +51,9 @@ src/tool.ts      tool definition (transitional edits[] surface) + chain + teachi
 src/chain.ts     ordered strategy chain (matches on LF-normalized content, returns spans)
 src/escape-drift.ts  escape-drift guards — port of hermes `_detect_escape_drift` (blocks
                  the write when args carry serialization artifacts the file lacks)
-src/shaping.ts   reindentReplacement — port of hermes `_reindent_replacement`
+src/shaping.ts   replacement shaping — conditional \t/\r unescape, unicode-preserving
+                 opcodes (verbatim difflib.SequenceMatcher port), reindent, splice
+                 (ports of hermes' orchestrator-tail shaping helpers)
 src/errors.ts    teaching error builders (did-you-mean, whitespace viz, recovery text)
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
 src/render.ts    TUI call/result renderers with live preview (uses OUR engine)
@@ -100,8 +102,13 @@ hermes or add a row to PLAN.md's deviations ledger.
   visualization (`file has: ····→code`); ambiguity errors list up to 5 `L<line>: snippet`
   locations. Target hermes' texts verbatim (analysis Appendix B), modulo pi tool names
   (ledger #10). Error text is model-facing API — changes to it are behavior changes.
-- **Replacement shaping**: for tolerant (non-exact) matches, the replacement is re-indented
-  onto the file's indent style; for exact matches, replacement bytes are kept verbatim.
+- **Replacement shaping** (`src/shaping.ts`, hermes orchestrator tail): every match gets
+  the conditional `\t`/`\r` unescape over its matched regions (exact included — issue
+  #33733; `\n` never rewritten); tolerant matches then re-indent onto the file's indent
+  style, and `unicode_normalized` matches apply only the old→new opcodes so each region's
+  original typographic characters survive. Opcode plans come from the verbatim
+  `difflib.SequenceMatcher` port — never swap in the `diff`-package opcodes (different
+  edit script → different written text).
 - **File fidelity**: pre-normalize LF, restore BOM and CRLF on write; writes go through
   `withFileMutationQueue`. The schema strings intentionally promise tolerance ("tolerates
   minor whitespace/indentation drift") — keep that promise in the implementation.

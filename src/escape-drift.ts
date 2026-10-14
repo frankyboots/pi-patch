@@ -26,8 +26,8 @@ export type EscapeDrift =
 	/** Every backslash run in oldText exactly 2x the file's. */
 	| { kind: "backslash_doubling" };
 
-/** hermes `_matched_regions`: the matched file bytes, concatenated. Also
- * serves `_maybe_unescape_new_string` when Tier 1 #4 lands. */
+/** hermes `_matched_regions`: the matched file bytes, concatenated. Shared
+ * with the Tier 1 #4 shaping (`_maybe_unescape_new_string`'s region probe). */
 export function matchedRegions(content: string, spans: readonly Span[]): string {
 	return spans.map((s) => content.slice(s.start, s.end)).join("");
 }
