@@ -270,14 +270,10 @@ export function unknownModeError(mode: unknown): string {
 	return `Unknown mode: ${String(mode)}`;
 }
 
-/** V4A patch mode lands in Tier 3; the handler refuses it instead of silently
- * falling back to replace mode (deviations ledger #15). */
-export function patchModeUnavailableError(): string {
-	return (
-		"mode='patch' (V4A multi-file patch) is not available in this build of patch. " +
-		"Apply one replacement with path + old_string + new_string instead, or use " +
-		"write for a whole-file rewrite."
-	);
+/** hermes `patch_tool`'s mode='patch' gate: `if not patch: return
+ * tool_error("patch content required")` — verbatim. */
+export function patchContentRequiredError(): string {
+	return "patch content required";
 }
 
 /** The transitional `edits[]` surface is retired (Tier 2 #5). Models trained on

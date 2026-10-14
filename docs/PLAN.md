@@ -92,9 +92,10 @@ Implemented so far:
       `execute()` so the gates can't be skipped by an SDK/preview caller.
       hermes' handler gates run in hermes' order (`path required` →
       `old_string and new_string required` → empty/whitespace-only/identical →
-      unknown mode), `''` deletes the matched text, and the unadvertised
-      `mode`/`patch` params are accepted from any model but answered with
-      "not available in this build" until Tier 3 (ledger #15). Prompt
+      unknown mode), `''` deletes the matched text; the unadvertised
+      `mode`/`patch` params are accepted from any model (at the time of landing
+      answered "not available in this build" — V4A went live with Tier 3
+      #9/#10). Prompt
       contribution, TUI renderer (preview runs the same normalized call) and the
       whole test corpus moved with it; the replace-mode error texts are now
       byte-exact Appendix B modulo pi tool names (ledger #10) — that closes most
@@ -114,6 +115,9 @@ Implemented so far:
       generic `_hint` attaches whenever the error carries no "Did you mean"
       snippet. Hints ride inside the message text (ledger #6). The TUI preview
       deliberately never touches the tracker — only execute() counts.
+      *Complete since Tier 3 #9/#10:* the patch-mode texts (`patch content
+      required`, the traversal veto, the validation/apply wrappers) are
+      byte-exact too.
 
 - [x] Tier 3 #8: `patch_parser.py` ported verbatim (`src/v4a.ts`). `parseV4APatch`
       (markers column-0-anchored so content that merely mentions the format can't
@@ -149,8 +153,46 @@ Implemented so far:
       replace-mode deviation: an identical old/new re-send whose text is already
       present (≥ 8 non-blank chars) now returns hermes' success-shaped no-op
       (hermes `_no_match_result` ordering) instead of the teaching error. The
-      tool handler still answers "not available in this build" until #9/#10 wire
-      it (ledger #15).
+      handler switch-over landed with #9/#10 (ledger #15 rewritten: V4A is live).
+
+- [x] Tier 3 #9: schema layering live. `src/gate.ts` ports hermes
+      `_is_openai_family_main` (provider allowlist {openai, openai-chat,
+      openai-codex, azure-openai, codex}; slug-after-first-slash prefixes
+      {gpt-, gpt., chatgpt, codex, o1, o3, o4, o5}; the `"openai/" in model`
+      substring rule; fail-closed on empty identity), fed by the live
+      `ctx.model` with the ledger-#9 `PI_PROVIDER`/`PI_MODEL` env fallback.
+      Pi has no `dynamic_schema_overrides`, so the layer rides **tool
+      re-registration** on `session_start`/`model_select`/`turn_start`: when the
+      gate flips on, `patch` re-registers with hermes' layered schema (`mode`
+      first, `patch` last, `mode` the only REQUIRED param — descriptions
+      verbatim incl. the dual-mode swap-in and the one extra V4A guideline,
+      ledger #13 applied to BOTH variants); off-family sessions keep the exact
+      base schema and pay zero V4A tokens. The handler accepts both shapes from
+      any model regardless of what was advertised (replay compat):
+      `validateCall` dispatches exclusively on `mode` in hermes' gate order —
+      `Unknown mode:` → (`patch`: `patch content required`) →
+      (`replace`: `path required` → `old_string and new_string required` →
+      empty/whitespace-only/identical) — and a stray `patch` param on a
+      complete replace call still lands the edit.
+
+- [x] Tier 3 #10: tool-layer plumbing live (`src/v4a-fs.ts` + the `executeV4ACall`
+      tail of `tool.ts`). Header support functions ported from `patch_tool`:
+      `_collect_v4a_header_paths` (single + Move headers, content-write vs
+      entry split, hermes' `'..'`-traversal veto text via `pyRepr`) with
+      hermes' component-based `has_traversal_component` (matches PATH
+      components, not substrings), and `_rewrite_v4a_patch_paths_for_host`
+      (Update/Add → resolved, Delete/Move → entry path). Locking replaces
+      hermes' `ExitStack` of `lock_path`s with nested `withFileMutationQueue`
+      over the sorted, de-duplicated resolved paths (deadlock-free by
+      construction, ledger #3's mechanism). `createHostV4AFileOps` implements
+      the duck-typed `V4AFileOps` against the real FS — synchronous
+      read/write, NOT-FOUND answers for absent paths, binary refusal (NUL in
+      first 8 KB) in place of hermes' binary-document gate (ledger #4's
+      boundary), and BOM/CRLF fidelity on every write (ledger #2). Success
+      reports hermes' dict fields in pi text shape: `files_modified` (absolute,
+      Move = BOTH endpoints) + `files_created`/`files_deleted` + `resolved_path`
+      when single, then the unified diff. V4A misses bypass the failure tracker
+      ("V4A misses are rare"), any success resets the touched paths' streaks.
 
 ## Build plan (exact-port tiers)
 
@@ -192,8 +234,9 @@ though V4A is now in scope.
       locations, replace_all refusal, no-match + hint + whitespace diagnosis,
       already-applied, escape-drift, empty/whitespace-only/identical, the arg
       gates, `Unknown mode:`, plus #6's escalation and generic `_hint`) are
-      byte-exact and asserted verbatim in `test/patch.test.ts`; what's left is
-      patch-mode parse/validation text, owned by Tier 3 #8/#9.
+      byte-exact and asserted verbatim in `test/patch.test.ts`; the patch-mode
+      parse/validation texts landed with Tier 3 #8/#9/#10 — the ledger is now
+      text-complete.
 
 ### Tier 3 — V4A patch mode
 
@@ -203,12 +246,13 @@ though V4A is now in scope.
       `fuzzy_find_and_replace` entry lives in `chain.ts` and both surfaces call it;
       `get_grouped_opcodes`/`_format_range_unified` on `shaping.ts`'s SequenceMatcher,
       now element-agnostic. Handler wiring is #9/#10.)
-- [ ] 9. Schema layering: base schema replace-only; `mode`+`patch` params and the dual-mode
+- [x] 9. Schema layering: base schema replace-only; `mode`+`patch` params and the dual-mode
       description layered only when the OpenAI-family gate passes (`PI_PROVIDER`/`PI_MODEL`,
       fail-closed); handler accepts both shapes from any model; `mode` defaults to `replace`.
-- [ ] 10. Tool-layer plumbing: `..`-traversal rejection in patch headers, sorted per-path
+      (`src/gate.ts` + re-registration, see Tier 3 #9 status entry.)
+- [x] 10. Tool-layer plumbing: `..`-traversal rejection in patch headers, sorted per-path
       mutation queueing over all touched files, absolute `files_modified` (+ `resolved_path`
-      when single) in the result.
+      when single) in the result. (`src/v4a-fs.ts` + `executeV4ACall`, see Tier 3 #10.)
 
 ### Tier 4 — operational parity
 
@@ -281,4 +325,5 @@ first.
 | 12 | `replace_all` de-duplicates self-overlapping line-window spans (leftmost-greedy, str.replace semantics) instead of splicing them | deliberate improvement | hermes' window rungs can emit overlapping spans under `replace_all` and its reverse-order splice then corrupts the file (e.g. ` a\na` over `a\na\na` → `R`); hermes itself fixed exactly this for `_strategy_exact` ("aligns with str.replace") — the same non-overlap invariant is enforced for every strategy |
 | 13 | Base description omits hermes' "Auto-runs syntax checks after editing." promise | environment-forced | pi exposes no lint harness (row #5); advertising it would teach the model to wait for diagnostics that never arrive. The rest of hermes' base description is verbatim |
 | 14 | `edits[]` is not a `patch` parameter: a call carrying it (single entry → flattened, several → refused with a teaching error) | deliberate | the transitional multi-edit surface is retired by #5; silently applying the first of several requested replacements would report work that never happened, so the refusal teaches the flat shape and says "do not re-send this call unchanged" |
-| 15 | `mode`/`patch` are accepted from any model but answered with "V4A … is not available in this build" until the handler switches over | deliberate (interim; the parser itself is ported — Tier 3 #8, `src/v4a.ts` — the refusal remains until #9/#10 wire it in) | hermes would apply the patch; we must not pretend to. The base schema stays replace-only exactly like hermes' unlayered schema, `Unknown mode: X` keeps hermes' text, and the handler-side acceptance is already in place so #9 only adds schema layering + the dispatch. Nuance kept hermes-compatible: hermes' mode dispatch is exclusive and defaults to `replace`, so a **stray** `patch` param on a complete replace call is ignored (the edit lands); only `mode="patch"`, or V4A-looking content with no complete replacement in flight, gets the refusal — where hermes answers `patch content required` we answer "not available", since that is the true statement here |
+| 15 | V4A is advertised only when the OpenAI-family gate passes; off-family sessions see the replace-only schema | deliberate (matches hermes) | hermes layers `mode`/`patch` + the dual-mode description via `dynamic_schema_overrides` only for OpenAI-family main models (fail-closed, §2.1/§7) — off-family models never pay the V4A prompt tokens and are not taught a format their output stats rarely produce. The **handler** still accepts both shapes from any model (replay compat), dispatches exclusively on `mode` in hermes' gate order, and answers `patch content required` / `Unknown mode:` verbatim; a stray `patch` param on a complete replace call is ignored, exactly like hermes' exclusive mode dispatch |
+| 16 | The schema layer rides tool **re-registration** (`session_start`/`model_select`/`turn_start` → `registerTool`), not hermes' per-request `dynamic_schema_overrides` | environment-forced | pi fixes `parameters` at registration; re-registering swaps the live definition when the gate flips. `turn_start` is the belt-and-braces tick for model changes that emit no event. If pi grows dynamic overrides, `applyGate` collapses to them |

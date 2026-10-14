@@ -36,7 +36,11 @@ Kept from pi (each a row in the PLAN.md deviations ledger): LF pre-normalization
 handling, `withFileMutationQueue`, constrained sampling, renderer integration, argument
 normalization. `patch` speaks hermes' single-replacement surface
 (`old_string`/`new_string`/`replace_all`, Tier 2 #5): one replacement per call, with
-multi-hunk/multi-file work reserved for the V4A patch mode (Tier 3), exactly as in hermes.
+multi-hunk/multi-file work on the V4A patch mode (Tier 3, live): `mode: "patch"` + a V4A
+patch body applies Update/Add/Delete/Move hunks across files, atomically (validate-then-write).
+The V4A schema is **advertised only behind hermes' OpenAI-family gate** (provider/model
+heuristics, `PI_PROVIDER`/`PI_MODEL` fallback, fail-closed); the handler accepts both call
+shapes from any model, so session replays keep working (ledger #15/#16).
 Models trained on `edit` are still understood — `preparePatchArguments` maps
 `oldText`/`newText`/`replaceAll`/`file_path` and a single-entry `edits[]` onto hermes' names —
 but a call asking for several replacements is refused, never half-applied (ledger #14). The
@@ -73,6 +77,8 @@ Give the model the same edit both ways:
 - `patch` a genuinely absent text → the error shows the closest sections so the next
   attempt is informed, not blind.
 - `patch` an edit that already landed → success-shaped no-op; no turn burned.
+- `patch` with `mode: "patch"` → a V4A multi-file patch (Update/Add/Delete/Move) applied
+  in one call — advertised on OpenAI-family models, accepted from any model.
 
 ## Status
 
@@ -80,17 +86,18 @@ Give the model the same edit both ways:
 checklist, validation bar, and the deviations ledger that records every intentional difference
 from hermes. Update it as work lands.
 
-Short version: replace mode is ported. Done so far: the full 9-strategy chain (`exact`
-through `context_aware`, in hermes' order), the escape-drift guards, replacement shaping
-(reindent, unicode-preserving opcodes, conditional `\t`/`\r` unescape), hermes' `replace_all`,
-hermes' flat surface with hermes' argument gates (Tier 2 #5), teaching errors byte-exact to
-Appendix B modulo pi tool names, the already-applied no-op, the model-facing unified diff +
-own preview renderer, argument normalization, the failure counter + escalation (Tier 2 #6),
-and the V4A parser/applier (`src/v4a.ts`, Tier 3 #8 — parse → validate → apply, Update hunks
-through the shared chain). Remaining: the V4A handler wiring (schema layering + plumbing,
-Tier 3 #9/#10 — the handler already *accepts* `mode`/`patch` and refuses with "not available
-in this build" until then, ledger #15), and operational parity — post-write verification,
-staleness tracking, strategy telemetry (Tier 4).
+Short version: the port is feature-complete through Tier 3. Done: the full 9-strategy chain
+(`exact` through `context_aware`, in hermes' order), the escape-drift guards, replacement
+shaping (reindent, unicode-preserving opcodes, conditional `\t`/`\r` unescape), hermes'
+`replace_all`, hermes' flat surface with hermes' argument gates (Tier 2 #5), teaching errors
+byte-exact to Appendix B modulo pi tool names, the already-applied no-op, the model-facing
+unified diff + own preview renderer, argument normalization, the failure counter + escalation
+(Tier 2 #6), the V4A parser/applier (`src/v4a.ts`, Tier 3 #8 — parse → validate → apply,
+Update hunks through the shared chain), the OpenAI-family schema layering (`src/gate.ts`,
+Tier 3 #9 — base schema stays replace-only; the `mode`/`patch` layer re-registers when the
+gate passes), and the V4A tool-layer plumbing (`src/v4a-fs.ts`, Tier 3 #10 — header traversal
+veto, sorted mutation queueing, absolute `files_modified`). Remaining: operational parity —
+post-write verification, staleness tracking, strategy telemetry (Tier 4).
 
 ## Development
 
@@ -102,13 +109,19 @@ npm run typecheck
 Layout:
 
 ```
-src/index.ts     extension entry — registers `patch` + renderers
-src/tool.ts      tool definition: hermes' flat surface + arg gates + shaping orchestrator
-src/chain.ts     ordered strategy chain (spans into LF-normalized content)
-src/shaping.ts   replacement shaping: conditional \t/\r unescape, unicode-preserving
-                 opcodes (verbatim difflib.SequenceMatcher port), reindent, splice
-src/errors.ts    teaching error builders (did-you-mean, whitespace viz)
+src/index.ts      extension entry — gate-aware `patch` registration + TUI renderers
+src/tool.ts       tool definition: hermes' dual-mode surface, arg gates, shaping orchestrator
+src/gate.ts       OpenAI-family gate (hermes _is_openai_family_main) deciding V4A advertising
+src/chain.ts      ordered strategy chain (spans into LF-normalized content)
+src/shaping.ts    replacement shaping: conditional \t/\r unescape, unicode-preserving
+                  opcodes (verbatim difflib.SequenceMatcher port), reindent, splice
+src/v4a.ts        V4A patch parser/applier — parse → validate → apply (hermes patch_parser)
+src/v4a-fs.ts     V4A host layer — header collection/rewrite, traversal veto, sorted mutation
+                  queueing, real-FS V4AFileOps with BOM/CRLF fidelity
+src/errors.ts     teaching error builders (did-you-mean, whitespace viz)
+src/failure-tracker.ts  per-path consecutive-miss counter + escalation (hermes tracker)
 src/diff-utils.ts display diff + unified patch (pi-compatible formats)
-src/render.ts    TUI call/result renderers with live preview via our engine
-src/text.ts      LF/BOM/CRLF helpers, line index
+src/render.ts     TUI call/result renderers with live preview via our engine
+src/text.ts       LF/BOM/CRLF helpers, line index
+src/span-map.ts   span-mapping helpers ported verbatim from hermes fuzzy_match.py
 ```

@@ -40,6 +40,13 @@ import {
 	unicodeEditPlan,
 } from "../src/shaping.js";
 import { detectEscapeDrift } from "../src/escape-drift.js";
+import { isOpenaiFamilyMain, shouldAdvertiseV4A } from "../src/gate.js";
+import {
+	collectV4AHeaderPaths,
+	createHostV4AFileOps,
+	hasTraversalComponent,
+	rewriteV4APatchPathsForHost,
+} from "../src/v4a-fs.js";
 import { clearPatchFailures, recordPatchFailure, resetPatchFailures } from "../src/failure-tracker.js";
 import {
 	applyV4AOperations,
@@ -999,6 +1006,101 @@ describe("tool: advertised schema is hermes' base PATCH_SCHEMA", () => {
 	});
 });
 
+describe("gate: OpenAI family (hermes _is_openai_family_main, Tier 3 #9)", () => {
+	it("matches hermes' provider allowlist, case- and whitespace-insensitively", () => {
+		for (const provider of ["openai", "openai-chat", "openai-codex", "azure-openai", "codex"]) {
+			expect(isOpenaiFamilyMain(provider, "anything")).toBe(true);
+			expect(isOpenaiFamilyMain(` ${provider.toUpperCase()} `, "anything")).toBe(true);
+		}
+		expect(isOpenaiFamilyMain("anthropic", "claude-sonnet-4-5")).toBe(false);
+		expect(isOpenaiFamilyMain("google", "gemini-2.5-pro")).toBe(false);
+	});
+
+	it("reads the family from the model slug on aggregators", () => {
+		// slug after the FIRST slash (Python model.split("/", 1)[-1])
+		expect(isOpenaiFamilyMain("openrouter", "openai/gpt-5")).toBe(true);
+		expect(isOpenaiFamilyMain("openrouter", "OpenAI/GPT-5")).toBe(true);
+		expect(isOpenaiFamilyMain("openrouter", "anthropic/claude-sonnet-4.5")).toBe(false);
+		expect(isOpenaiFamilyMain("nous", "x-ai/grok-4")).toBe(false);
+		// bare slugs are their own family signal
+		expect(isOpenaiFamilyMain("gateway", "gpt-4o")).toBe(true);
+		expect(isOpenaiFamilyMain("gateway", "gpt.5")).toBe(true);
+		expect(isOpenaiFamilyMain("gateway", "o3-mini")).toBe(true);
+		expect(isOpenaiFamilyMain("gateway", "codex-mini-latest")).toBe(true);
+		expect(isOpenaiFamilyMain("gateway", "chatgpt-4o-latest")).toBe(true);
+		// the substring rule is hermes' `"openai/" in model`
+		expect(isOpenaiFamilyMain("gateway", "proxy/openai/gpt-4")).toBe(true);
+		// NOT prefix-based on the full id: "o1" only counts as a slug
+		expect(isOpenaiFamilyMain("gateway", "sonnet-o1")).toBe(false);
+	});
+
+	it("fails closed without a model identity", () => {
+		expect(isOpenaiFamilyMain(undefined, undefined)).toBe(false);
+		expect(isOpenaiFamilyMain("", "")).toBe(false);
+		expect(isOpenaiFamilyMain("  ", "  ")).toBe(false);
+	});
+
+	it("prefers the live model, falls back to PI_PROVIDER/PI_MODEL (ledger #9)", () => {
+		expect(shouldAdvertiseV4A({ provider: "openai", id: "gpt-5" }, {})).toBe(true);
+		// a live non-OpenAI model is NOT overridden by a stale environment pair
+		expect(
+			shouldAdvertiseV4A({ provider: "anthropic", id: "claude-sonnet-4-5" }, { PI_PROVIDER: "openai", PI_MODEL: "gpt-5" }),
+		).toBe(false);
+		expect(shouldAdvertiseV4A(undefined, { PI_PROVIDER: "openrouter", PI_MODEL: "openai/gpt-5" })).toBe(true);
+		expect(shouldAdvertiseV4A(undefined, {})).toBe(false);
+	});
+});
+
+describe("tool: V4A schema layering (hermes _patch_schema_overrides, Tier 3 #9)", () => {
+	const layered = createPatchToolDefinition("/tmp", { advertiseV4A: true });
+	const base = createPatchToolDefinition("/tmp");
+	const params = layered.parameters as unknown as { properties: Record<string, unknown>; required?: string[] };
+	const baseParams = base.parameters as unknown as { properties: Record<string, unknown>; required?: string[] };
+
+	it("composes mode first, base properties, patch last; mode is the only required param", () => {
+		expect(Object.keys(params.properties)).toEqual(["mode", "path", "old_string", "new_string", "replace_all", "patch"]);
+		expect(params.required).toEqual(["mode"]);
+		// the base schema is untouched by the layer's existence (ledger #15 closes:
+		// off-family sessions keep paying zero V4A tokens)
+		expect(Object.keys(baseParams.properties).sort()).toEqual(["new_string", "old_string", "path", "replace_all"]);
+		expect([...(baseParams.required ?? [])].sort()).toEqual(["new_string", "old_string", "path"]);
+	});
+
+	it("swaps in hermes' dual-mode description and one extra guideline", () => {
+		const description = String(layered.description);
+		expect(description).toContain("REPLACE MODE (mode='replace', default): find a unique string and replace it.");
+		expect(description).toContain("REQUIRED PARAMETERS: mode, path, old_string, new_string.");
+		expect(description).toContain("PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes.");
+		expect(description).toContain("REQUIRED PARAMETERS: mode, patch.");
+		// ledger #13 covers BOTH description variants: no syntax-check promise
+		expect(description).not.toContain("syntax");
+		expect(String(base.description)).not.toContain("PATCH MODE");
+		expect(layered.promptGuidelines?.some((g) => g.includes('mode="patch"'))).toBe(true);
+		expect(base.promptGuidelines?.some((g) => g.includes('mode="patch"'))).toBe(false);
+	});
+
+	it("keeps hermes' layered param descriptions verbatim", () => {
+		expect((params.properties.mode as { description: string }).description).toBe(
+			"Edit mode. 'replace' (default): requires path + old_string + new_string. 'patch': requires patch content only.",
+		);
+		expect((params.properties.patch as { description: string }).description).toBe(
+			"REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
+		);
+	});
+
+	it("keeps the replace gates handler-side: layered replace calls land, hollow ones answer hermes' texts", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-layered-"));
+		const file = path.join(dir, "s.txt");
+		await fs.writeFile(file, "abc\n", "utf-8");
+		const run = (input: object) => layered.execute("t", input as never, undefined, undefined, { cwd: dir } as never);
+		// mode="replace" alongside path/old/new is hermes' normal path
+		await run({ mode: "replace", path: "s.txt", old_string: "abc", new_string: "xyz" });
+		expect(await fs.readFile(file, "utf-8")).toBe("xyz\n");
+		await expect(run({ mode: "patch" })).rejects.toThrow(/^patch content required$/);
+		await expect(run({ mode: "replace" })).rejects.toThrow(/^path required$/);
+	});
+});
+
 describe("tool: preparePatchArguments (schema_sanitizer analog, ledger #8)", () => {
 	it("passes hermes' flat shape through untouched", () => {
 		expect(preparePatchArguments({ path: "f", old_string: "a", new_string: "b", replace_all: true })).toEqual({
@@ -1250,21 +1352,25 @@ describe("tool: execute against real files", () => {
 		);
 	});
 
-	it("answers an unadvertised mode instead of silently editing", async () => {
-		// V4A is Tier 3; the base schema doesn't advertise `mode`, but hermes'
-		// handler still accepts it from any model — and must never pretend to have
-		// applied a patch it cannot parse.
+	it("dispatches the unadvertised V4A shape instead of refusing it", async () => {
+		// The base schema does not advertise `mode`, but hermes' handler accepts
+		// both shapes from any model (replay compat): mode="patch" runs the real
+		// V4A path, and hermes' gates answer in hermes' order.
 		const { dir, file, name } = await tmpFile("abc\n");
-		await expect(run({ path: name, mode: "patch", patch: "*** Begin Patch\n*** End Patch" }, dir)).rejects.toThrow(
-			/mode='patch' \(V4A multi-file patch\) is not available/,
-		);
 		await expect(run({ path: name, mode: "sideways", old_string: "abc", new_string: "x" }, dir)).rejects.toThrow(
 			/^Unknown mode: sideways$/,
 		);
 		expect(await fs.readFile(file, "utf-8")).toBe("abc\n");
-		// hermes answers mode='patch' with no content as "patch content required";
-		// pre-Tier 3 both shapes get the same "not available" answer (ledger #15)
-		await expect(run({ path: name, mode: "patch" }, dir)).rejects.toThrow(/mode='patch' \(V4A multi-file patch\) is not available/);
+		// hermes' mode='patch' gate: `if not patch: tool_error("patch content required")`.
+		await expect(run({ path: name, mode: "patch" }, dir)).rejects.toThrow(/^patch content required$/);
+		expect(await fs.readFile(file, "utf-8")).toBe("abc\n");
+		// A syntactically valid but content-free patch reaches VALIDATION (not a
+		// refusal): hermes' empty-ops text rides the validation wrapper — proving
+		// the V4A pipeline dispatched — and nothing is written.
+		await expect(run({ path: name, mode: "patch", patch: "*** Begin Patch\n*** End Patch" }, dir)).rejects.toThrow(
+			/^Patch validation failed \(no files were modified\):\n {2}• Patch contains no changes \(only context lines were provided\)$/,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe("abc\n");
 	});
 
 	it("ignores a stray patch param on a complete replace call, like hermes", async () => {
@@ -1273,6 +1379,226 @@ describe("tool: execute against real files", () => {
 		const { dir, file, name } = await tmpFile("abc\n");
 		await run({ path: name, old_string: "abc", new_string: "xyz", patch: "*** Begin Patch\n*** End Patch" }, dir);
 		expect(await fs.readFile(file, "utf-8")).toBe("xyz\n");
+	});
+});
+
+describe("v4a-fs: header plumbing (hermes patch_tool support layer, Tier 3 #10)", () => {
+	it("has_traversal_component matches path COMPONENTS, not substrings", () => {
+		expect(hasTraversalComponent("a/../b")).toBe(true);
+		expect(hasTraversalComponent("../b")).toBe(true);
+		expect(hasTraversalComponent("a/..")).toBe(true);
+		expect(hasTraversalComponent("a\\..\\b")).toBe(true);
+		expect(hasTraversalComponent("a..b")).toBe(false);
+		expect(hasTraversalComponent("..hidden/x")).toBe(false);
+		expect(hasTraversalComponent("a/b.txt")).toBe(false);
+	});
+
+	it("collects header paths split by write-kind and vetoes traversal with hermes' text", () => {
+		const patch = [
+			"*** Begin Patch",
+			"*** Update File: a.txt",
+			"@@",
+			" x",
+			"*** Add File: b.txt",
+			"+y",
+			"*** Delete File: c.txt",
+			"*** Move File: old.txt -> new.txt",
+			"*** End Patch",
+		].join("\n");
+		expect(collectV4AHeaderPaths(patch)).toEqual({
+			all: ["a.txt", "b.txt", "c.txt", "old.txt", "new.txt"],
+			contentWrite: ["a.txt", "b.txt"],
+			entry: ["c.txt", "old.txt", "new.txt"],
+		});
+		const bad = collectV4AHeaderPaths("*** Update File: ../etc/passwd\n@@\n x");
+		expect(typeof bad).toBe("string");
+		expect(String(bad)).toBe(
+			"V4A patch header contains '..' traversal: '../etc/passwd'. " +
+				"Use the agent's cwd-relative path (no '..') or an absolute " +
+				"path in '*** Update File:' / '*** Add File:' / '*** Delete File:' / '*** Move File:' headers.",
+		);
+	});
+
+	it("rewrites headers to resolved paths; Delete and Move take the ENTRY path", () => {
+		const patch = ["*** Update File: a.txt", "*** Delete File: c.txt", "*** Move File: o.txt -> n.txt"].join("\n");
+		const resolved = new Map([
+			["a.txt", "/abs/a.txt"],
+			["c.txt", "/abs/c.txt"],
+			["o.txt", "/abs/o.txt"],
+			["n.txt", "/abs/n.txt"],
+		]);
+		const entry = new Map([
+			["c.txt", "/entry/c.txt"],
+			["o.txt", "/entry/o.txt"],
+			["n.txt", "/entry/n.txt"],
+		]);
+		expect(rewriteV4APatchPathsForHost(patch, resolved, entry)).toBe(
+			["*** Update File: /abs/a.txt", "*** Delete File: /entry/c.txt", "*** Move File: /entry/o.txt -> /entry/n.txt"].join("\n"),
+		);
+	});
+
+	it("host file ops round-trip BOM and CRLF through the raw read/write pair", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-v4afops-"));
+		const file = path.join(dir, "f.txt");
+		await fs.writeFile(file, "\uFEFFone\r\ntwo\r\n", "utf-8");
+		const ops = createHostV4AFileOps();
+		const read = ops.readFileRaw(file);
+		expect(read.error).toBeNull();
+		// matched on LF-normalized content, BOM split off (ledger #2 fidelity)
+		expect(read.content).toBe("one\ntwo\n");
+		ops.writeFile(file, "one\nTWO\n");
+		expect(await fs.readFile(file, "utf-8")).toBe("\uFEFFone\r\nTWO\r\n");
+		// absent path reports NOT FOUND — the answer that frees an Add target
+		expect(ops.readFileRaw(path.join(dir, "missing.txt"))).toMatchObject({ content: null, notFound: true });
+	});
+});
+
+describe("tool: V4A execute against real files (Tier 3 #10)", () => {
+	const tool = createPatchToolDefinition("/tmp");
+
+	async function tmpDir(): Promise<string> {
+		return fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-v4a-"));
+	}
+	async function run(patch: string, cwd: string) {
+		return tool.execute("v4a-call", { mode: "patch", patch } as never, undefined, undefined, { cwd } as never);
+	}
+	function textOf(result: { content: { type: string; text?: string }[] }): string {
+		return result.content.map((c) => c.text ?? "").join("\n");
+	}
+
+	it("applies Update + Add + Delete + Move in one call and reports every path", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "a.txt"), "one\ntwo\nthree\n", "utf-8");
+		await fs.writeFile(path.join(dir, "old.txt"), "move me\n", "utf-8");
+		await fs.writeFile(path.join(dir, "gone.txt"), "bye\n", "utf-8");
+		const result = await run(
+			[
+				"*** Begin Patch",
+				"*** Update File: a.txt",
+				"@@",
+				" one",
+				"-two",
+				"+TWO",
+				" three",
+				"*** Add File: new.txt",
+				"+created",
+				"*** Delete File: gone.txt",
+				"*** Move File: old.txt -> moved.txt",
+				"*** End Patch",
+			].join("\n"),
+			dir,
+		);
+		expect(await fs.readFile(path.join(dir, "a.txt"), "utf-8")).toBe("one\nTWO\nthree\n");
+		// hermes' Add-File content joins the '+' body lines without a trailing
+		// newline (add one with a bare '+' line if you want one)
+		expect(await fs.readFile(path.join(dir, "new.txt"), "utf-8")).toBe("created");
+		expect(await fs.readFile(path.join(dir, "moved.txt"), "utf-8")).toBe("move me\n");
+		await expect(fs.readFile(path.join(dir, "gone.txt"), "utf-8")).rejects.toThrow();
+		await expect(fs.readFile(path.join(dir, "old.txt"), "utf-8")).rejects.toThrow();
+		const text = textOf(result);
+		expect(text).toContain("Successfully applied V4A patch.");
+		// hermes reports ABSOLUTE paths; Move reports BOTH endpoints (entry paths)
+		expect(text).toContain(`files_modified: ${[
+			path.join(dir, "a.txt"),
+			path.join(dir, "new.txt"),
+			path.join(dir, "gone.txt"),
+			path.join(dir, "old.txt"),
+			path.join(dir, "moved.txt"),
+		].join(", ")}`);
+		expect(text).toContain(`files_created: ${path.join(dir, "new.txt")}`);
+		expect(text).toContain(`files_deleted: ${path.join(dir, "gone.txt")}`);
+		expect((result.details as { diff: string }).diff).toContain(`--- a/${path.join(dir, "a.txt")}`);
+	});
+
+	it("single-file patches carry resolved_path", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "solo.txt"), "alpha\n", "utf-8");
+		const result = await run("*** Begin Patch\n*** Update File: solo.txt\n@@\n-alpha\n+ALPHA\n*** End Patch", dir);
+		const text = textOf(result);
+		expect(text).toContain(`resolved_path: ${path.join(dir, "solo.txt")}`);
+		expect(text).not.toContain("files_created");
+	});
+
+	it("vetoes '..' traversal in headers before touching the filesystem", async () => {
+		const dir = await tmpDir();
+		const outside = path.join(dir, "..", "outside.txt");
+		const patch = "*** Begin Patch\n*** Update File: ../outside.txt\n@@\n-a\n+b\n*** End Patch";
+		await expect(run(patch, dir)).rejects.toThrow(
+			/^V4A patch header contains '\.\.' traversal: '\.\.\/outside\.txt'\. Use the agent's cwd-relative path/,
+		);
+		await expect(fs.readFile(outside, "utf-8")).rejects.toThrow();
+	});
+
+	it("preserves CRLF and BOM through V4A updates (host file ops)", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "crlf.txt"), "\uFEFFone\r\ntwo\r\n", "utf-8");
+		await run("*** Begin Patch\n*** Update File: crlf.txt\n@@\n-one\n+ONE\n*** End Patch", dir);
+		expect(await fs.readFile(path.join(dir, "crlf.txt"), "utf-8")).toBe("\uFEFFONE\r\ntwo\r\n");
+	});
+
+	it("routes Update hunks through the shared chain: tolerant matching lands sloppy hunks", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "t.txt"), "def greet():\n\treturn 1\n", "utf-8");
+		// the hunk carries space indent where the file has a tab — the
+		// indentation_flexible rung still lands the match. Shaping then keeps the
+		// hunk's indentation verbatim: hermes' re-indent only shifts by a COMMON
+		// prefix, and tab vs spaces share none — same written text as hermes.
+		await run(
+			"*** Begin Patch\n*** Update File: t.txt\n@@\n-def greet():\n-    return 1\n+def greet():\n+    return 42\n*** End Patch",
+			dir,
+		);
+		expect(await fs.readFile(path.join(dir, "t.txt"), "utf-8")).toBe("def greet():\n    return 42\n");
+	});
+
+	it("a failed patch modifies nothing (two-phase validation) and teaches the hermes error", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "keep.txt"), "one\ntwo\n", "utf-8");
+		await expect(
+			run(
+				[
+					"*** Begin Patch",
+					"*** Update File: keep.txt",
+					"@@",
+					"-one",
+					"+ONE",
+					"*** Add File: keep.txt",
+					"+would clobber",
+					"*** End Patch",
+				].join("\n"),
+				dir,
+			),
+		).rejects.toThrow(/already exists/);
+		expect(await fs.readFile(path.join(dir, "keep.txt"), "utf-8")).toBe("one\ntwo\n");
+	});
+
+	it("V4A misses bypass the failure tracker; V4A success resets it", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "miss.txt"), "alpha\n", "utf-8");
+		const replaceMiss = (oldString: string) =>
+			tool.execute("c", { path: "miss.txt", old_string: oldString, new_string: "q" } as never, undefined, undefined, {
+				cwd: dir,
+			} as never);
+		// two replace misses (below the escalation threshold)
+		await expect(replaceMiss("zzz")).rejects.toThrow(/Could not find/);
+		await expect(replaceMiss("yyy")).rejects.toThrow(/Could not find/);
+		// a V4A miss on the SAME path: hermes does not count these ("V4A misses
+		// are rare"), so the next replace miss is failure #3 — if the V4A miss
+		// had counted it would read failure #4
+		await expect(run("*** Begin Patch\n*** Update File: miss.txt\n@@\n-nope\n+yes\n*** End Patch", dir)).rejects.toThrow(
+			/Could not find/,
+		);
+		await expect(replaceMiss("xxx")).rejects.toThrow(/This is failure #3 patching/);
+		// success (either mode) resets the per-path count: the next miss teaches
+		// a fresh streak (no counter yet — escalation only speaks from #3)
+		await run("*** Begin Patch\n*** Update File: miss.txt\n@@\n-alpha\n+ALPHA\n*** End Patch", dir);
+		let finalMessage = "";
+		try {
+			await replaceMiss("bbb");
+		} catch (error) {
+			finalMessage = error instanceof Error ? error.message : String(error);
+		}
+		expect(finalMessage).toContain("Could not find");
+		expect(finalMessage).not.toContain("This is failure");
 	});
 });
 

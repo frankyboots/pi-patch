@@ -20,6 +20,7 @@
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { computePatchDiff, preparePatchArguments, type Replacement } from "./tool.js";
+import { describeV4AHeaderPaths } from "./v4a-fs.js";
 
 type PatchPreview = { diff: string; firstChangedLine?: number } | { error: string };
 
@@ -83,8 +84,17 @@ function getCallComponent(state: PatchRenderState, lastComponent: unknown): Patc
 }
 
 function formatCall(args: PatchToolRenderArgs, theme: Theme): string {
+	const label = theme.fg("toolTitle", theme.bold("patch"));
 	const path = typeof args.path === "string" ? args.path : "";
-	return `${theme.fg("toolTitle", theme.bold("patch"))} ${theme.fg("accent", path)}`;
+	if (path) return `${label} ${theme.fg("accent", path)}`;
+	// V4A call: no single path — name the files the patch headers touch instead,
+	// so a streaming patch-mode call is readable in the transcript too.
+	const patch = typeof args.patch === "string" ? args.patch : undefined;
+	if (args.mode === "patch" || patch !== undefined) {
+		const paths = patch ? describeV4AHeaderPaths(patch) : "";
+		return `${label} ${theme.fg("accent", paths ? `V4A patch — ${paths}` : "V4A patch")}`;
+	}
+	return label;
 }
 
 /** Colored diff body using public theme keys (context/removed/added). */

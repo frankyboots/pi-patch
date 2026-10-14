@@ -68,8 +68,12 @@ test).
 ## Layout
 
 ```
-src/index.ts     extension entry — registers `patch` + TUI renderers
-src/tool.ts      tool definition (hermes' flat surface) + arg gates + shaping orchestrator
+src/index.ts     extension entry — gate-aware `patch` registration + TUI renderers
+                 (re-registers the tool when the OpenAI-family gate flips)
+src/tool.ts      tool definition (hermes' dual-mode surface) + arg gates + shaping orchestrator
+src/gate.ts      OpenAI-family gate — port of hermes `_is_openai_family_main` + the
+                 PI_PROVIDER/PI_MODEL fallback; decides whether V4A is ADVERTISED
+                 (the handler accepts both shapes from any model regardless)
 src/chain.ts     ordered strategy chain (matches on LF-normalized content, returns spans)
 src/escape-drift.ts  escape-drift guards — port of hermes `_detect_escape_drift` (blocks
                  the write when args carry serialization artifacts the file lacks)
@@ -80,8 +84,11 @@ src/errors.ts    teaching error builders (did-you-mean, whitespace viz, recovery
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
 src/v4a.ts       V4A patch parser/applier — port of hermes `patch_parser.py` (parse →
                  validate → apply, Tier 3 #8); duck-typed `V4AFileOps` so tests run
-                 in-memory and the tool layer (Tier 3 #10) supplies the real
-                 mutation-queued implementation
+                 in-memory
+src/v4a-fs.ts    V4A host layer (Tier 3 #10) — header path collection + `'..'`-traversal
+                 veto, header rewriting to resolved paths, nested `withFileMutationQueue`
+                 over sorted-deduped lock paths, real-FS `V4AFileOps` (BOM/CRLF fidelity,
+                 binary refusal)
 src/render.ts    TUI call/result renderers with live preview (uses OUR engine)
 src/text.ts      LF/BOM/CRLF helpers, line index
 src/span-map.ts  span-mapping helpers ported verbatim from hermes `fuzzy_match.py`
@@ -121,13 +128,21 @@ hermes or add a row to PLAN.md's deviations ledger.
   (`replace_all` landed as Tier 1 #2 with hermes' semantics: every match of the winning
   strategy splices, similarity strategies refuse it; see ledger #12 for the self-overlap
   guard hermes lacks.)
-- **V4A patch mode is in scope, not optional**: `patch` grows `mode:"patch"` with hermes'
-  schema layering (advertised to OpenAI-family models only, fail-closed; accepted from any
-  model) — analysis §2.1, PLAN.md Tier 3. The parser/applier is ported (`src/v4a.ts`,
-  Tier 3 #8 — Update hunks ride the shared chain via `fuzzyFindAndReplace`, application is
-  two-phase validate-then-write); the handler still answers "not available in this build"
-  (ledger #15) until Tier 3 #9/#10 add the schema layering and tool-layer plumbing. That
-  switch replaces the refusal with the parser, not with new acceptance code.
+- **V4A patch mode is live behind hermes' gate** (Tier 3 #9/#10): the base schema stays
+  replace-only; `mode`/`patch` params, the dual-mode description and the V4A guideline are
+  layered in only when `src/gate.ts` says the main model is OpenAI-family (fail-closed;
+  `PI_PROVIDER`/`PI_MODEL` env fallback when there is no live model info — ledger #9).
+  Pi has no `dynamic_schema_overrides`, so the layer rides **tool re-registration** on
+  `session_start`/`model_select`/`turn_start` (ledger #16). The handler accepts both call
+  shapes from any model regardless of what was advertised (replay compat) and dispatches
+  exclusively on `mode` in hermes' gate order (`Unknown mode:` → `patch content required` →
+  the replace gates); a stray `patch` param on a complete replace call is ignored, like
+  hermes' exclusive dispatch. Execute-path order for `mode:"patch"`: collect header paths +
+  traversal veto → resolve → rewrite headers to absolute paths → sorted-deduped nested
+  `withFileMutationQueue` → `applyV4APatch` (two-phase validate-then-write, Update hunks
+  riding the shared chain via `fuzzyFindAndReplace`) → reset the failure tracker for the
+  touched paths → report absolute `files_modified` (+ `resolved_path` when single). V4A
+  misses bypass the failure tracker (hermes: "V4A misses are rare") — never wire them in.
 - **Already-applied no-op is success-shaped** ("do not re-send this patch"), with a
   conservative guard: `new_string` ≥ 8 non-blank chars present exactly and `old_string` gone.
   Keep it conservative — it must never mask a real partial application.

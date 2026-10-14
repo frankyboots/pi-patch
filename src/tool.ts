@@ -1,13 +1,20 @@
 /**
- * The `patch` tool definition — an exact port of hermes' `patch` replace mode
- * (docs/EDIT-TOOL-ANALYSIS.md §2, §6 item 1). The surface is hermes':
- * `path` + `old_string` + `new_string` + `replace_all`, **one replacement per
- * call** (multi-hunk/multi-file work is the V4A patch mode's job, Tier 3). The
- * matching core is hermes' too: the 9-strategy chain, the escape-drift guards,
- * the orchestrator tail (conditional `\t`/`\r` unescape, unicode-preserving
- * opcodes, reindent, splice), the teaching errors, and the session-scoped
- * failure-escalation tracker that turns repeated misses on one file into a
- * "stop retrying" hint (Tier 2 #6).
+ * The `patch` tool definition — an exact port of hermes' `patch` tool
+ * (docs/EDIT-TOOL-ANALYSIS.md §2, §2.1, §6 item 1). Dual-mode like hermes:
+ * `replace` (default) is the single-replacement surface — `path` +
+ * `old_string` + `new_string` + `replace_all`, one replacement per call — and
+ * `mode: "patch"` applies V4A multi-file patches through the tool-layer
+ * plumbing in `v4a-fs.ts`. The base advertised schema is replace-only
+ * (hermes' `PATCH_SCHEMA`); the V4A layer (`mode` + `patch` params,
+ * dual-mode description) is layered on only when the OpenAI-family gate
+ * passes (`gate.ts`, Tier 3 #9, ledger #9) — the HANDLER accepts both shapes
+ * from any model regardless, mode defaulting to `replace` (replay compat).
+ * The matching core is hermes' too: the 9-strategy chain, the escape-drift
+ * guards, the orchestrator tail (conditional `\t`/`\r` unescape,
+ * unicode-preserving opcodes, reindent, splice), the teaching errors, and the
+ * session-scoped failure-escalation tracker that turns repeated misses on one
+ * file into a "stop retrying" hint (Tier 2 #6; replace mode only — V4A misses
+ * bypass the tracker, hermes file_tools.py:1022).
  *
  * Kept from pi (deviations ledger #2/#3/#7/#8): LF pre-normalization with
  * BOM/CRLF restoration, `withFileMutationQueue`, constrained sampling, and the
@@ -24,6 +31,8 @@ import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from ".
 import { recordPatchFailure, resetPatchFailures } from "./failure-tracker.js";
 import { fuzzyFindAndReplace, isAlreadyApplied, type StrategyName } from "./chain.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
+import { applyV4APatch } from "./v4a.js";
+import { collectV4AHeaderPaths, createHostV4AFileOps, rewriteV4APatchPathsForHost, withSortedMutationQueue } from "./v4a-fs.js";
 import {
 	alreadyAppliedMessage,
 	failureEscalationHint,
@@ -32,15 +41,17 @@ import {
 	missingPathError,
 	missingReplacementError,
 	multiEditRefusalError,
-	patchModeUnavailableError,
+	patchContentRequiredError,
 	unknownModeError,
 } from "./errors.js";
 
 /**
  * hermes `PATCH_SCHEMA` (base, replace-only). The V4A layer (`mode` + `patch`
- * params, dual-mode description) is Tier 3; the handler still *accepts* those
- * params from any model, the schema just doesn't advertise them — exactly
- * hermes' posture. `replace_all` carries no `default` keyword: pi's
+ * params, dual-mode description) is layered on by
+ * `createPatchToolDefinition(cwd, { advertiseV4A: true })` behind the
+ * OpenAI-family gate; the handler still *accepts* those params from any model,
+ * the schema just doesn't advertise them off-family — exactly hermes'
+ * posture. `replace_all` carries no `default` keyword: pi's
  * constrained-sampling JSON schema is stricter than hermes' free-form dict, and
  * the description states the default instead.
  */
@@ -63,12 +74,60 @@ const patchSchema = Type.Object(
 	{},
 );
 
+/** hermes `_PATCH_V4A_PARAMS["mode"]` — enum + description verbatim; no
+ * `default` keyword (same constrained-sampling rationale as replace_all), and
+ * the handler defaults an omitted mode to `replace` like hermes. */
+const v4aModeParam = Type.Union([Type.Literal("replace"), Type.Literal("patch")], {
+	description:
+		"Edit mode. 'replace' (default): requires path + old_string + new_string. 'patch': requires patch content only.",
+});
+
+/** hermes `_PATCH_V4A_PARAMS["patch"]` — description verbatim. */
+const v4aPatchParam = Type.Optional(
+	Type.String({
+		description:
+			"REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
+	}),
+);
+
+/** hermes `_patch_schema_overrides` composed parameters: `mode` first, base
+ * properties next (all optional — the replace gates stay handler-side),
+ * `patch` last; `mode` is the only required param (hermes' layered
+ * `required` list). Descriptions repeat the base schema's verbatim because
+ * `Type.Optional` mutates its argument (a shared instance would leak
+ * optionality into the base schema). */
+const patchSchemaV4A = Type.Object(
+	{
+		mode: v4aModeParam,
+		path: Type.Optional(Type.String({ description: "File path to edit." })),
+		old_string: Type.Optional(
+			Type.String({
+				description:
+					"Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
+			}),
+		),
+		new_string: Type.Optional(
+			Type.String({
+				description: "Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text.",
+			}),
+		),
+		replace_all: Type.Optional(
+			Type.Boolean({
+				description: "Replace all occurrences instead of requiring a unique match (default: false)",
+			}),
+		),
+		patch: v4aPatchParam,
+	},
+	{},
+);
+
 export type PatchToolInput = {
 	path: string;
 	old_string: string;
 	new_string: string;
 	replace_all?: boolean;
-	/** hermes' dual-mode params — accepted from any model, honored in Tier 3 */
+	/** hermes' dual-mode params — accepted from any model, even when the
+	 * advertised schema omits them (replay compat, Tier 3 #9). */
 	mode?: unknown;
 	patch?: unknown;
 	/** Retired transitional surface — kept in the type only so the handler can
@@ -189,23 +248,28 @@ export function preparePatchArguments(input: unknown): PatchToolInput {
 	return args as unknown as PatchToolInput;
 }
 
+/** A call that passed the hermes handler gates, ready to dispatch. */
+export type ValidatedCall =
+	| { mode: "replace"; path: string; replacement: Replacement }
+	| { mode: "patch"; patch: string };
+
 /** hermes' mode/arg gates (`patch_tool`'s if/elif chain), in hermes' order:
  * the mode dispatch is exclusive, so an unknown `mode` answers before the
- * replace-mode gates, and replace mode ignores a stray `patch` param. */
-function validateCall(input: PatchToolInput): { path: string; replacement: Replacement } {
+ * replace-mode gates, and replace mode ignores a stray `patch` param. A model
+ * that dropped `mode` but sent V4A-looking content defaults to replace mode
+ * like hermes — the V4A path is entered by `mode: "patch"`, never by guessing
+ * from a stray param. */
+function validateCall(input: PatchToolInput): ValidatedCall {
 	const mode = typeof input.mode === "string" ? input.mode : undefined;
 	if (mode !== undefined && mode !== "replace" && mode !== "patch") throw new Error(unknownModeError(mode));
-	// A model that dropped `mode` but sent V4A-looking content is only steered at
-	// the missing mode when no complete replacement is in flight: hermes defaults
-	// to replace mode and ignores `patch` entirely, so a stray param must never
-	// refuse an edit hermes would land.
-	const completeReplacement =
-		typeof input.path === "string" && input.path.length > 0 && typeof input.old_string === "string" && typeof input.new_string === "string";
-	const v4aIntent =
-		mode === "patch" ||
-		(mode === undefined && !completeReplacement && typeof input.patch === "string" && input.patch.includes("***"));
-	// V4A lands in Tier 3; refuse instead of pretending to have applied it.
-	if (v4aIntent) throw new Error(patchModeUnavailableError());
+
+	if (mode === "patch") {
+		// hermes: `if not patch: return tool_error("patch content required")`.
+		// The traversal gate and application then live in the execute path,
+		// after header collection and before any lock is taken.
+		if (typeof input.patch !== "string" || input.patch.length === 0) throw new Error(patchContentRequiredError());
+		return { mode: "patch", patch: input.patch };
+	}
 
 	const edits = parseEdits(input.edits);
 	if (edits && edits.length > 0) throw new Error(multiEditRefusalError(edits.length));
@@ -215,6 +279,7 @@ function validateCall(input: PatchToolInput): { path: string; replacement: Repla
 		throw new Error(missingReplacementError());
 	}
 	return {
+		mode: "replace",
 		path: input.path,
 		replacement: {
 			oldString: input.old_string,
@@ -244,10 +309,9 @@ export type ReplacementOutcome =
  * onto a failed replace call. Only plain no-match errors participate — the
  * "Could not find" substring gate keeps ambiguity, escape-drift and
  * replace_all refusals out (they explain themselves; hermes counts the same
- * set). Recording is replace-mode-only here by construction: validateCall
- * refuses every other mode before matching, and when V4A lands (Tier 3) its
- * misses must keep bypassing this (hermes counts replace misses only —
- * "V4A misses are rare", file_tools.py:1022). Failure #3 and beyond escalates
+ * set). Recording is replace-mode-only by construction: V4A calls dispatch
+ * around this entirely (hermes counts replace misses only — "V4A misses
+ * are rare", file_tools.py:1022). Failure #3 and beyond escalates
  * to the "stop retrying" hint; below the threshold a generic `_hint` attaches
  * whenever the error carries no richer "Did you mean" snippet. Per ledger #6
  * the hint rides inside the message text (pi results have no JSON envelope).
@@ -297,35 +361,109 @@ const defaultEditOperations = {
 	access: (path: string) => fsAccess(path, constants.R_OK | constants.W_OK),
 };
 
+/** hermes `PATCH_SCHEMA["description"]` verbatim — EXCEPT the "Auto-runs
+ * syntax checks after editing." clause, dropped rather than kept (deviations
+ * ledger #13): pi exposes no lint harness, so promising it would teach the
+ * model to wait for diagnostics that never arrive. */
+const patchDescriptionBase =
+	"Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. " +
+	"Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. " +
+	"Returns a unified diff. Finds a unique string and replaces it.";
+
+/** hermes `_PATCH_V4A_DESCRIPTION` verbatim, modulo the same syntax-check
+ * clause removal (ledger #13 covers both variants; hermes' override text
+ * carries the clause, ours must not). */
+const patchDescriptionV4A =
+	"Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. " +
+	"Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. " +
+	"Returns a unified diff.\n\n" +
+	"REPLACE MODE (mode='replace', default): find a unique string and replace it. " +
+	"REQUIRED PARAMETERS: mode, path, old_string, new_string.\n" +
+	"PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. " +
+	"REQUIRED PARAMETERS: mode, patch.";
+
+/** Extra guideline advertised only with the V4A layer (the mode param it
+ * references is absent from the base schema). */
+const v4aGuideline =
+	'For bulk multi-file or multi-hunk edits use mode="patch" with a V4A patch (*** Begin Patch / *** Update File: <path> / @@ context / -removed +added lines / *** End Patch)';
+
+/**
+ * hermes `patch_tool`'s patch-mode body, in hermes' order: collect every path
+ * named in patch HEADERS (patch content is more attacker-influenceable than
+ * `path=`, and `..` traversal is vetoed before anything is resolved or
+ * locked), resolve each against the session cwd, REWRITE the headers to the
+ * resolved paths so the applier patches exactly the files being queued and
+ * reported, then take pi's mutation queues in hermes' sorted, deduplicated
+ * order (deadlock avoidance for overlapping concurrent patches).
+ * V4A misses bypass the failure-escalation tracker entirely (hermes
+ * file_tools.py "V4A misses are rare"): no counting, no generic hint, no
+ * escalation — just the hermes error text. Success resets the per-path
+ * counters and reports absolute files_modified (Delete/Move report the ENTRY
+ * path, like hermes' `_paths_to_check`).
+ */
+async function executeV4ACall(patchArg: string, cwd: string, throwIfAborted: () => void) {
+	const collected = collectV4AHeaderPaths(patchArg);
+	if (typeof collected === "string") throw new Error(collected);
+	const pathToResolved = new Map(collected.all.map((raw) => [raw, resolveToCwd(raw, cwd)]));
+	const pathToEntry = new Map(collected.entry.map((raw) => [raw, resolveToCwd(raw, cwd)]));
+	const hostPatch = rewriteV4APatchPathsForHost(patchArg, pathToResolved, pathToEntry);
+	const lockedPaths = [...new Set([...pathToResolved.values(), ...pathToEntry.values()])].sort();
+	throwIfAborted();
+	return withSortedMutationQueue(lockedPaths, async () => {
+		throwIfAborted();
+		const result = applyV4APatch(hostPatch, createHostV4AFileOps());
+		throwIfAborted();
+		if (result.error) throw new Error(result.error);
+		resetPatchFailures([...pathToResolved.values()]);
+		const filesModified = collected.all.map((raw) => pathToEntry.get(raw) ?? pathToResolved.get(raw) ?? raw);
+		const summary = ["Successfully applied V4A patch.", "", `files_modified: ${filesModified.join(", ")}`];
+		if (result.filesCreated.length > 0) summary.push(`files_created: ${result.filesCreated.join(", ")}`);
+		if (result.filesDeleted.length > 0) summary.push(`files_deleted: ${result.filesDeleted.join(", ")}`);
+		if (filesModified.length === 1) summary.push(`resolved_path: ${filesModified[0]}`);
+		return {
+			content: [
+				{ type: "text" as const, text: summary.join("\n") },
+				...(result.diff ? [{ type: "text" as const, text: result.diff }] : []),
+			],
+			details: { diff: result.diff, patch: result.diff } satisfies PatchToolDetails,
+		};
+	});
+}
+
 export function createPatchToolDefinition(
 	cwd: string,
-): ToolDefinition<typeof patchSchema, PatchToolDetails | undefined> {
+	options: { advertiseV4A?: boolean } = {},
+	// The advertised schema is one of two concrete TypeBox objects (hermes'
+	// base `PATCH_SCHEMA` / the V4A-layered override); the union keeps the
+	// renderers' argument types checkable for both. The handler re-normalizes
+	// and gates every call regardless (`prepareArguments` + `validateCall`).
+): ToolDefinition<typeof patchSchema | typeof patchSchemaV4A, PatchToolDetails | undefined> {
+	const advertiseV4A = options.advertiseV4A === true;
 	const ops = defaultEditOperations;
 	return {
 		name: "patch",
 		label: "patch",
-		// hermes' base description verbatim, minus "Auto-runs syntax checks after
-		// editing." — pi exposes no lint harness, so promising it would be a lie
-		// (deviations ledger #5/#13).
-		description:
-			"Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. " +
-			"Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. " +
-			"Returns a unified diff. Finds a unique string and replaces it.",
+		description: advertiseV4A ? patchDescriptionV4A : patchDescriptionBase,
 		promptSnippet: patchToolSystemPromptContribution.snippet,
-		promptGuidelines: [...patchToolSystemPromptContribution.guidelines],
-		parameters: patchSchema,
+		promptGuidelines: advertiseV4A
+			? [...patchToolSystemPromptContribution.guidelines, v4aGuideline]
+			: [...patchToolSystemPromptContribution.guidelines],
+		parameters: advertiseV4A ? patchSchemaV4A : patchSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		prepareArguments: preparePatchArguments,
 		async execute(_toolCallId, input, signal, _onUpdate, ctx) {
 			// Re-run the (idempotent) normalization: pi's harness calls
 			// prepareArguments first, but SDK and preview callers may hand over raw
 			// model arguments, and the gates must not be skippable.
-			const { path, replacement } = validateCall(preparePatchArguments(input) as PatchToolInput);
+			const call = validateCall(preparePatchArguments(input) as PatchToolInput);
+			const throwIfAborted = () => {
+				if (signal?.aborted) throw new Error("Operation aborted");
+			};
+			throwIfAborted();
+			if (call.mode === "patch") return executeV4ACall(call.patch, ctx?.cwd || cwd, throwIfAborted);
+			const { path, replacement } = call;
 			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
 			return withFileMutationQueue(absolutePath, async () => {
-				const throwIfAborted = () => {
-					if (signal?.aborted) throw new Error("Operation aborted");
-				};
 				throwIfAborted();
 				try {
 					await ops.access(absolutePath);
@@ -375,8 +513,12 @@ export function createPatchToolDefinition(
 						{
 							type: "text",
 							// Model-facing diff (analysis §4: pi's diff never reaches the
-							// model — a free self-check loop for weak models).
-							text: `Successfully replaced ${applied.replacements} block(s) in ${path}.\n\n${patch}`,
+							// model — a free self-check loop for weak models), plus
+							// hermes' absolute-path reporting (`files_modified` +
+							// `resolved_path` are in every patch_tool success payload).
+							text:
+								`Successfully replaced ${applied.replacements} block(s) in ${path}.\n\n` +
+								`files_modified: ${absolutePath}\nresolved_path: ${absolutePath}\n\n${patch}`,
 						},
 					],
 					details: {
