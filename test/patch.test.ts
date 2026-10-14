@@ -41,6 +41,7 @@ import {
 } from "../src/shaping.js";
 import { detectEscapeDrift } from "../src/escape-drift.js";
 import { isOpenaiFamilyMain, shouldAdvertiseV4A } from "../src/gate.js";
+import { editFormatFamily, editFormatGuideline } from "../src/edit-guidance.js";
 import {
 	collectV4AHeaderPaths,
 	createHostV4AFileOps,
@@ -1098,6 +1099,60 @@ describe("tool: V4A schema layering (hermes _patch_schema_overrides, Tier 3 #9)"
 		expect(await fs.readFile(file, "utf-8")).toBe("xyz\n");
 		await expect(run({ mode: "patch" })).rejects.toThrow(/^patch content required$/);
 		await expect(run({ mode: "replace" })).rejects.toThrow(/^path required$/);
+	});
+});
+
+describe("edit-guidance: hermes _EDIT_FORMAT_GUIDANCE prompt steering (ledger #17)", () => {
+	it("selects the patch family for gpt/codex ids (substring, patch needles first)", () => {
+		expect(editFormatFamily("gpt-5")).toBe("patch");
+		expect(editFormatFamily("openai/gpt-4.1-mini")).toBe("patch");
+		expect(editFormatFamily("codex-mini-latest")).toBe("patch");
+		expect(editFormatFamily("GPT-5")).toBe("patch");
+		// hermes' dict order checks the patch needles before the replace ones
+		expect(editFormatFamily("hermes-codex-merge")).toBe("patch");
+	});
+	it("selects the replace family for the other known coder slugs", () => {
+		const ids = [
+			"claude-sonnet-4.5", "claude-opus-4", "gemini-2.5-pro", "gemma-3",
+			"deepseek-coder-v2", "qwen3.8-flash-next", "kimi-k2", "glm-4.6",
+			"grok-4", "hermes-4", "llama-3.3-70b", "mistral-large",
+			"devstral-small", "minimax-m2",
+		];
+		for (const id of ids) expect(editFormatFamily(id)).toBe("replace");
+	});
+	it("returns null for unknown/empty ids (hermes: unknown families get nothing)", () => {
+		expect(editFormatFamily("zephyr-7b-beta")).toBeNull();
+		expect(editFormatFamily("")).toBeNull();
+		expect(editFormatFamily(undefined)).toBeNull();
+		expect(editFormatGuideline("zephyr-7b-beta")).toBeNull();
+	});
+	it("ports hermes' steering texts verbatim modulo ledger #10 tool names", () => {
+		const patchLine = editFormatGuideline("gpt-5") ?? "";
+		expect(patchLine).toContain("author new files with `write`;");
+		expect(patchLine).toContain("mode='patch' (V4A diff) — including single-file edits");
+		expect(patchLine).toContain("It's the edit format you handle most reliably.");
+		expect(patchLine).not.toContain("write_file");
+		const replaceLine = editFormatGuideline("qwen3.8") ?? "";
+		expect(replaceLine).toContain("prefer `patch` in mode='replace'");
+		expect(replaceLine).toContain("Reach for mode='patch' (V4A) only when an edit genuinely spans several files at once");
+	});
+	it("teaches V4A on the BASE schema for off-family coder models (prompt, not schema)", () => {
+		const def = createPatchToolDefinition("/tmp", { modelId: "qwen3.8-flash-next" });
+		const params = def.parameters as unknown as { properties: Record<string, unknown> };
+		// schema stays the exact replace-only base (ledger #15)...
+		expect(params.properties.mode).toBeUndefined();
+		expect(params.properties.patch).toBeUndefined();
+		// ...while the prompt steering names the V4A dialect anyway (ledger #17)
+		expect(def.promptGuidelines?.some((g) => g.includes("mode='patch' (V4A)"))).toBe(true);
+	});
+	it("steering supersedes the generic V4A guideline; unknown ids keep it only with the layer", () => {
+		const steeredLayered = createPatchToolDefinition("/tmp", { advertiseV4A: true, modelId: "gpt-5" });
+		expect(steeredLayered.promptGuidelines?.some((g) => g.includes("*** Begin Patch"))).toBe(false);
+		expect(steeredLayered.promptGuidelines?.some((g) => g.includes("most reliably"))).toBe(true);
+		const unknownLayered = createPatchToolDefinition("/tmp", { advertiseV4A: true });
+		expect(unknownLayered.promptGuidelines?.some((g) => g.includes('mode="patch"'))).toBe(true);
+		const unknownBase = createPatchToolDefinition("/tmp", { modelId: "zephyr-7b-beta" });
+		expect(unknownBase.promptGuidelines?.every((g) => !g.includes("mode"))).toBe(true);
 	});
 });
 

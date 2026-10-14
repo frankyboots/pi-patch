@@ -40,7 +40,11 @@ multi-hunk/multi-file work on the V4A patch mode (Tier 3, live): `mode: "patch"`
 patch body applies Update/Add/Delete/Move hunks across files, atomically (validate-then-write).
 The V4A schema is **advertised only behind hermes' OpenAI-family gate** (provider/model
 heuristics, `PI_PROVIDER`/`PI_MODEL` fallback, fail-closed); the handler accepts both call
-shapes from any model, so session replays keep working (ledger #15/#16).
+shapes from any model, so session replays keep working (ledger #15/#16). V4A *teaching* is
+separate, like hermes': a model-id needle table (`src/edit-guidance.ts`, hermes
+`_EDIT_FORMAT_GUIDANCE`) steers known coder families — GPT/Codex toward V4A for everything,
+others toward replace with V4A for genuinely multi-file work — regardless of the gate
+(ledger #17).
 Models trained on `edit` are still understood — `preparePatchArguments` maps
 `oldText`/`newText`/`replaceAll`/`file_path` and a single-entry `edits[]` onto hermes' names —
 but a call asking for several replacements is refused, never half-applied (ledger #14). The
@@ -112,6 +116,8 @@ Layout:
 src/index.ts      extension entry — gate-aware `patch` registration + TUI renderers
 src/tool.ts       tool definition: hermes' dual-mode surface, arg gates, shaping orchestrator
 src/gate.ts       OpenAI-family gate (hermes _is_openai_family_main) deciding V4A advertising
+src/edit-guidance.ts edit-format prompt steering (hermes _EDIT_FORMAT_GUIDANCE) keyed on
+                  model-id needles, independent of the gate (ledger #17)
 src/chain.ts      ordered strategy chain (spans into LF-normalized content)
 src/shaping.ts    replacement shaping: conditional \t/\r unescape, unicode-preserving
                   opcodes (verbatim difflib.SequenceMatcher port), reindent, splice

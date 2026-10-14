@@ -31,9 +31,9 @@ deviations ledger #1). When working in this repo, treat **`patch` as your defaul
 file edits** and `edit` as the fallback:
 
 - **Reach for `edit` only when you must finish work that `patch` can't do** — e.g. a
-  limitation of the single-replacement surface (several hunks still cost several calls until
-  V4A lands), or a suspected tool bug. Switching is
-  always allowed; never let a `patch` failure block the task.
+  suspected tool bug — multi-hunk/multi-file edits go through `mode:"patch"` (V4A)
+  when it is advertised. Switching is always allowed; never let a `patch` failure
+  block the task.
 - **If `patch` fails or misbehaves — wrong match, wrong shaping, spurious ambiguity,
   unhelpful error, render glitch — log it** in [docs/DOGFOOD.md](docs/DOGFOOD.md): what you
   attempted, the error or wrong result verbatim, expected vs actual, and the strategy you
@@ -74,6 +74,10 @@ src/tool.ts      tool definition (hermes' dual-mode surface) + arg gates + shapi
 src/gate.ts      OpenAI-family gate — port of hermes `_is_openai_family_main` + the
                  PI_PROVIDER/PI_MODEL fallback; decides whether V4A is ADVERTISED
                  (the handler accepts both shapes from any model regardless)
+src/edit-guidance.ts  edit-format prompt steering — port of hermes
+                 `_EDIT_FORMAT_GUIDANCE`/`_model_family` needle table (ledger #17); keys
+                 the V4A guideline on model-id substrings INDEPENDENT of the gate, so
+                 known off-family coder models are still taught V4A for multi-file work
 src/chain.ts     ordered strategy chain (matches on LF-normalized content, returns spans)
 src/escape-drift.ts  escape-drift guards — port of hermes `_detect_escape_drift` (blocks
                  the write when args carry serialization artifacts the file lacks)
@@ -81,6 +85,9 @@ src/shaping.ts   replacement shaping — conditional \t/\r unescape, unicode-pre
                  opcodes (verbatim difflib.SequenceMatcher port), reindent, splice
                  (ports of hermes' orchestrator-tail shaping helpers)
 src/errors.ts    teaching error builders (did-you-mean, whitespace viz, recovery text)
+src/failure-tracker.ts  session-scoped consecutive-failure counter + escalation — port of
+                 hermes `_patch_failure_tracker` (Tier 2 #6); keyed by resolved path
+                 (ledger #4), 64-path cap, replace-mode misses only
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
 src/v4a.ts       V4A patch parser/applier — port of hermes `patch_parser.py` (parse →
                  validate → apply, Tier 3 #8); duck-typed `V4AFileOps` so tests run
@@ -92,7 +99,7 @@ src/v4a-fs.ts    V4A host layer (Tier 3 #10) — header path collection + `'..'`
 src/render.ts    TUI call/result renderers with live preview (uses OUR engine)
 src/text.ts      LF/BOM/CRLF helpers, line index
 src/span-map.ts  span-mapping helpers ported verbatim from hermes `fuzzy_match.py`
-test/patch.test.ts  single vitest file covering chain, shaping, diff, and tool behavior
+test/patch.test.ts  single vitest file covering chain, shaping, V4A, errors, and tool behavior
 test/golden/     generated golden corpus — reference outputs from the hermes
                  implementation (do not hand-edit; see scripts/ to regenerate)
 scripts/         generate_span_map_golden.py — regenerates test/golden against
@@ -118,8 +125,10 @@ hermes or add a row to PLAN.md's deviations ledger.
   ambiguous — and matches hermes). Don't "simplify" this into a single global uniqueness check.
 - **Tool surface is hermes' single-replacement surface** (Tier 2 #5): `path` +
   `old_string` + `new_string` + optional `replace_all`, **exactly one replacement per
-  call**, hermes' gates in hermes' order (`path required` →
-  `old_string and new_string required` → empty/whitespace-only/identical → `Unknown mode:`).
+  call**, hermes' gates in hermes' order: `Unknown mode:` → `patch content required`
+  (patch mode) → multi-entry `edits[]` refusal → `path required` →
+  `old_string and new_string required` at validation; the empty/whitespace-only/identical
+  gates are enforced at replace execution (chain entry).
   `new_string: ""` deletes the matched text. The transitional `edits[]` schema is retired:
   `preparePatchArguments` (ledger #8) still flattens a *single-entry* `edits[]` and maps pi's
   `oldText`/`newText`/`replaceAll`/`file_path` spellings onto hermes' names, but a multi-entry
@@ -129,9 +138,16 @@ hermes or add a row to PLAN.md's deviations ledger.
   strategy splices, similarity strategies refuse it; see ledger #12 for the self-overlap
   guard hermes lacks.)
 - **V4A patch mode is live behind hermes' gate** (Tier 3 #9/#10): the base schema stays
-  replace-only; `mode`/`patch` params, the dual-mode description and the V4A guideline are
-  layered in only when `src/gate.ts` says the main model is OpenAI-family (fail-closed;
+  replace-only; the `mode`/`patch` params and the dual-mode description are layered onto
+  the SCHEMA only when `src/gate.ts` says the main model is OpenAI-family (fail-closed;
   `PI_PROVIDER`/`PI_MODEL` env fallback when there is no live model info — ledger #9).
+  V4A *teaching* is a second, independent surface (hermes `_EDIT_FORMAT_GUIDANCE`,
+  `src/edit-guidance.ts`, ledger #17): a model-id needle table keys a steering guideline
+  regardless of the gate, so known off-family coder models are still taught V4A for
+  genuinely multi-file work (a steered family supersedes our generic V4A guideline).
+  Gate-closed harnesses validate tool calls against the base schema — a V4A call from
+  such a session must also carry an (ignored, per hermes' exclusive mode dispatch)
+  `old_string`/`new_string` pair to satisfy the harness-side schema check.
   Pi has no `dynamic_schema_overrides`, so the layer rides **tool re-registration** on
   `session_start`/`model_select`/`turn_start` (ledger #16). The handler accepts both call
   shapes from any model regardless of what was advertised (replay compat) and dispatches
@@ -150,6 +166,13 @@ hermes or add a row to PLAN.md's deviations ledger.
   visualization (`file has: ····→code`); ambiguity errors list up to 5 `L<line>: snippet`
   locations. Target hermes' texts verbatim (analysis Appendix B), modulo pi tool names
   (ledger #10). Error text is model-facing API — changes to it are behavior changes.
+- **Repeated misses escalate** (Tier 2 #6, `src/failure-tracker.ts`): plain "Could not
+  find" replace-mode misses increment a per-resolved-path consecutive count; failure #3
+  appends hermes' "stop retrying" hint (below the threshold a generic hint attaches only
+  when the error carries no "Did you mean" section). Any successful patch — including the
+  already-applied no-op — resets the path. Ambiguity, escape-drift and identical-strings
+  errors never count (they explain themselves); V4A misses bypass the tracker entirely.
+  Keyed by resolved path alone, session-scoped (ledger #4); 64-path cap ported verbatim.
 - **Replacement shaping** (`src/shaping.ts`, hermes orchestrator tail): every match gets
   the conditional `\t`/`\r` unescape over its matched regions (exact included — issue
   #33733; `\n` never rewritten); tolerant matches then re-indent onto the file's indent

@@ -9,6 +9,10 @@
  * dual-mode description) is layered on only when the OpenAI-family gate
  * passes (`gate.ts`, Tier 3 #9, ledger #9) — the HANDLER accepts both shapes
  * from any model regardless, mode defaulting to `replace` (replay compat).
+ * The V4A *prompt steering* is a separate mechanism (hermes'
+ * `_EDIT_FORMAT_GUIDANCE`, `edit-guidance.ts`): a model-id needle table keys a
+ * one-line guideline INDEPENDENT of the schema gate, so known off-family coder
+ * models are still taught V4A for multi-file work (ledger #17).
  * The matching core is hermes' too: the 9-strategy chain, the escape-drift
  * guards, the orchestrator tail (conditional `\t`/`\r` unescape,
  * unicode-preserving opcodes, reindent, splice), the teaching errors, and the
@@ -29,6 +33,7 @@ import { Type } from "typebox";
 import { withFileMutationQueue, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from "./text.js";
 import { recordPatchFailure, resetPatchFailures } from "./failure-tracker.js";
+import { editFormatGuideline } from "./edit-guidance.js";
 import { fuzzyFindAndReplace, isAlreadyApplied, type StrategyName } from "./chain.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
 import { applyV4APatch } from "./v4a.js";
@@ -382,8 +387,11 @@ const patchDescriptionV4A =
 	"PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. " +
 	"REQUIRED PARAMETERS: mode, patch.";
 
-/** Extra guideline advertised only with the V4A layer (the mode param it
- * references is absent from the base schema). */
+/** Our bespoke V4A guideline (format sketch included). Hermes has no analog:
+ * its prompt steering (`edit-guidance.ts`) covers known families, and for
+ * unknown families the schema override itself is the teaching surface. So
+ * this line rides the V4A SCHEMA layer only when steering is absent (unknown
+ * family); a steered family's guideline supersedes it (ledger #17). */
 const v4aGuideline =
 	'For bulk multi-file or multi-hunk edits use mode="patch" with a V4A patch (*** Begin Patch / *** Update File: <path> / @@ context / -removed +added lines / *** End Patch)';
 
@@ -432,22 +440,28 @@ async function executeV4ACall(patchArg: string, cwd: string, throwIfAborted: () 
 
 export function createPatchToolDefinition(
 	cwd: string,
-	options: { advertiseV4A?: boolean } = {},
+	options: { advertiseV4A?: boolean; modelId?: string } = {},
 	// The advertised schema is one of two concrete TypeBox objects (hermes'
 	// base `PATCH_SCHEMA` / the V4A-layered override); the union keeps the
 	// renderers' argument types checkable for both. The handler re-normalizes
 	// and gates every call regardless (`prepareArguments` + `validateCall`).
 ): ToolDefinition<typeof patchSchema | typeof patchSchemaV4A, PatchToolDetails | undefined> {
 	const advertiseV4A = options.advertiseV4A === true;
+	// Hermes steers the edit format from the prompt, keyed on model-id needles
+	// and independent of the schema gate (ledger #17): the steering line names
+	// `mode='patch'` even when the advertised schema omits the params, and it
+	// supersedes our generic v4aGuideline when the family is known.
+	const steering = editFormatGuideline(options.modelId);
 	const ops = defaultEditOperations;
 	return {
 		name: "patch",
 		label: "patch",
 		description: advertiseV4A ? patchDescriptionV4A : patchDescriptionBase,
 		promptSnippet: patchToolSystemPromptContribution.snippet,
-		promptGuidelines: advertiseV4A
-			? [...patchToolSystemPromptContribution.guidelines, v4aGuideline]
-			: [...patchToolSystemPromptContribution.guidelines],
+		promptGuidelines: [
+			...patchToolSystemPromptContribution.guidelines,
+			...(steering ? [steering] : advertiseV4A ? [v4aGuideline] : []),
+		],
 		parameters: advertiseV4A ? patchSchemaV4A : patchSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		prepareArguments: preparePatchArguments,

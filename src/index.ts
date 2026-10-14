@@ -16,6 +16,12 @@
  * `turn_start` re-check so a mid-session model change through a path that
  * emits no event is still caught before the next request.
  *
+ * The same re-registration also carries the edit-format prompt steering
+ * (`edit-guidance.ts`, hermes `_EDIT_FORMAT_GUIDANCE`): that guideline is
+ * keyed on model-id needles INDEPENDENT of the schema gate (ledger #17), so
+ * the identity compare watches (gate, model id) — a family change without a
+ * gate flip still refreshes the live guidelines.
+ *
  * Load in development:
  *   pi --extension /path/to/pi-patch/src/index.ts
  *
@@ -24,26 +30,27 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shouldAdvertiseV4A, type ModelIdentity } from "./gate.js";
+import { guidanceModelId } from "./edit-guidance.js";
 import { createPatchToolDefinition } from "./tool.js";
 import { patchRenderers } from "./render.js";
 
 export default function piPatchExtension(pi: ExtensionAPI) {
-	const register = (advertiseV4A: boolean) =>
+	const register = (state: { advertiseV4A: boolean; modelId?: string }) =>
 		pi.registerTool({
-			...createPatchToolDefinition(process.cwd(), { advertiseV4A }),
+			...createPatchToolDefinition(process.cwd(), state),
 			...patchRenderers,
 		});
 
 	// Load-time registration is the base schema: the live model is not yet
 	// known, and the gate fails closed (hermes' unlayered PATCH_SCHEMA is the
 	// universal surface; V4A is the OpenAI-family dialect).
-	register(false);
+	register({ advertiseV4A: false });
 
-	let advertisingV4A = false;
+	let advertised: { advertiseV4A: boolean; modelId?: string } = { advertiseV4A: false, modelId: undefined };
 	const applyGate = (model?: ModelIdentity) => {
-		const want = shouldAdvertiseV4A(model);
-		if (want === advertisingV4A) return;
-		advertisingV4A = want;
+		const want = { advertiseV4A: shouldAdvertiseV4A(model), modelId: guidanceModelId(model) };
+		if (want.advertiseV4A === advertised.advertiseV4A && want.modelId === advertised.modelId) return;
+		advertised = want;
 		register(want);
 	};
 
