@@ -1,0 +1,37 @@
+{
+	"name": "pi-patch",
+	"version": "0.1.0",
+	"description": "pi extension: a 'patch' tool that runs alongside the built-in edit tool — hermes-style tolerant matching (whitespace/indentation), teaching errors with 'did you mean' sections, and model-facing diffs. Lets devs A/B test the matching engines without overriding anything.",
+	"type": "module",
+	"main": "src/index.ts",
+	"scripts": {
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"keywords": [
+		"pi",
+		"extension",
+		"edit",
+		"patch",
+		"fuzzy-matching"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=20"
+	},
+	"dependencies": {
+		"diff": "^8.0.4"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "1.2.0",
+		"@earendil-works/pi-tui": "^1.2.0",
+		"@types/node": "^22.0.0",
+		"typescript": "^5.7.0",
+		"vitest": "^3.0.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=1.2.0",
+		"@earendil-works/pi-tui": ">=1.2.0",
+		"typebox": ">=1.3.0"
+	}
+}
