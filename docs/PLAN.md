@@ -47,6 +47,21 @@ reschema):
       error now offers the flag. The hermes `TestReplaceAll` corpus is ported;
       the per-edit flag stands in for the flat schema one until Tier 2 #5
       reschemas.
+- [x] Tier 1 #3: escape-drift guards ported (`src/escape-drift.ts` —
+      `_detect_escape_drift` + `_detect_newline_literal_drift` +
+      `_detect_backslash_doubling` verbatim) and wired where hermes runs them:
+      inside the orchestrator, between a non-exact strategy win and the
+      splice. `runChain` takes the replacement text and refuses with a
+      `escape_drift` failure when oldText/newText carry serialization
+      artifacts the matched region lacks (literal `\n` for a real line
+      break, spurious `\'`/`\"`, doubled backslash runs), so execute() and
+      the TUI preview can never diverge on what gets written. Detection is
+      structured; texts are built in `errors.ts` from the JSON-probed hermes
+      messages (repr formatting included), modulo pi tool/param names and the
+      edit-#N-in-path context (ledger #10 + the transitional surface). The
+      `TestEscapeDriftGuard` and `TestNewlineLiteralDrift` corpora are
+      ported. Spans voted on are the post-non-overlap-filter set (ledger #12
+      consequence): only regions that will actually be written may veto.
 
 ## Build plan (exact-port tiers)
 
@@ -64,7 +79,7 @@ though V4A is now in scope.
       refuse it. (`replaceAll` per edit + flat coercion under the transitional
       surface; hermes' `TestReplaceAll` corpus ported; see ledger #12 for the
       self-overlap guard.)
-- [ ] 3. Escape-drift guards on every non-exact match (newline-literal, quote-suspect,
+- [x] 3. Escape-drift guards on every non-exact match (newline-literal, quote-suspect,
       backslash-doubling) before anything is written.
 - [ ] 4. Replacement shaping completion: `_reindent_replacement` (done), unicode-preserving
       opcode application, conditional `\t`/`\r` unescape of `new_string`.

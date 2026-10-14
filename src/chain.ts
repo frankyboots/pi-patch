@@ -24,10 +24,13 @@
  *
  * `runChain` is the orchestrator path (hermes' `fuzzy_find_and_replace`):
  * single-replacement semantics by default, `replaceAll` over every match of
- * the winning strategy (Tier 1 #2) — minus the escape-drift guards and
- * unicode-preserving replacement, which land with Tier 1 #3/#4.
+ * the winning strategy (Tier 1 #2), and the escape-drift guards on every
+ * non-exact match (Tier 1 #3) — hermes runs them inside the orchestrator,
+ * before anything is written; the unicode-preserving replacement opcodes
+ * (Tier 1 #4) are the remaining piece.
  */
 import { buildLineIndex, lineAt, similarity, type LineIndex } from "./text.js";
+import { detectEscapeDrift, type EscapeDrift } from "./escape-drift.js";
 import {
 	buildOrigToNormMap,
 	collapseWhitespace,
@@ -73,6 +76,10 @@ export type ChainFailure =
 	| { kind: "ambiguous"; strategy: StrategyName; count: number; locations: MatchLocation[] }
 	/** replace_all requested but the winning strategy only approximates oldText */
 	| { kind: "replace_all_similarity"; strategy: StrategyName; count: number }
+	/** Non-exact match succeeded but newText carries tool-call escape
+	 * artifacts the file does not have — writing it verbatim would corrupt
+	 * the file (Tier 1 #3, hermes `_detect_escape_drift`). */
+	| { kind: "escape_drift"; drift: EscapeDrift }
 	| { kind: "no_match" };
 
 export type ChainResult = { ok: true; match: ChainMatch } | { ok: false; failure: ChainFailure };
@@ -82,6 +89,10 @@ export interface RunChainOptions {
 	 * instead of requiring a unique one. Similarity strategies refuse it
 	 * (approximate matches must never be mass-overwritten — Tier 1 #2). */
 	replaceAll?: boolean;
+	/** Replacement text. Arms the escape-drift guards on non-exact matches
+	 * (Tier 1 #3) — hermes' orchestrator always has new_string available;
+	 * match-only probing without a replacement leaves the guards inert. */
+	newText?: string;
 }
 
 // ── Strategies ───────────────────────────────────────────────────────────
@@ -284,6 +295,15 @@ export function runChain(content: string, oldText: string, options: RunChainOpti
 			};
 		}
 		const spans = replaceAll ? nonOverlappingSpans(matches) : matches;
+		// Non-exact matches came through some normalization, so newText may
+		// carry serialization drift the file doesn't have — refuse before
+		// anything is written (hermes runs this between the strategy match and
+		// _apply_replacements). The spans voted on are exactly the ones that
+		// will be spliced (post non-overlap filter, ledger #12).
+		if (name !== "exact" && options.newText !== undefined) {
+			const drift = detectEscapeDrift(content, spans, oldText, options.newText);
+			if (drift) return { ok: false, failure: { kind: "escape_drift", drift } };
+		}
 		return { ok: true, match: { strategy: name, spans, exact: name === "exact" } };
 	}
 	return { ok: false, failure: { kind: "no_match" } };

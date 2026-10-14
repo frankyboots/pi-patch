@@ -49,6 +49,8 @@ test).
 src/index.ts     extension entry — registers `patch` + TUI renderers
 src/tool.ts      tool definition (transitional edits[] surface) + chain + teaching errors
 src/chain.ts     ordered strategy chain (matches on LF-normalized content, returns spans)
+src/escape-drift.ts  escape-drift guards — port of hermes `_detect_escape_drift` (blocks
+                 the write when args carry serialization artifacts the file lacks)
 src/shaping.ts   reindentReplacement — port of hermes `_reindent_replacement`
 src/errors.ts    teaching error builders (did-you-mean, whitespace viz, recovery text)
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)

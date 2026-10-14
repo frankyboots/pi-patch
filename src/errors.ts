@@ -9,6 +9,7 @@
  * (read/grep/find), not hermes' (read_file/search_files).
  */
 import { buildLineIndex, similarity } from "./text.js";
+import type { EscapeDrift } from "./escape-drift.js";
 
 const SNIPPET_MAX = 80;
 const MAX_SUGGESTIONS = 3;
@@ -151,6 +152,61 @@ export function overlapErrorMessage(
 	b: { index: number; startLine: number; endLine: number },
 ): string {
 	return `Edits #${a.index} and #${b.index} target overlapping regions in ${path} (L${a.startLine}-L${a.endLine} and L${b.startLine}-L${b.endLine}). Merge them into a single edit; each edits[].oldText is matched against the original file, not after earlier edits are applied.`;
+}
+
+/** Python repr for the sequences quoted in drift messages (hermes embeds
+ * `{suspect!r}`): backslashes double, and the delimiter is picked so the
+ * quote character itself needs no escaping. */
+function pyRepr(s: string): string {
+	let quote = "'";
+	let body = s.replaceAll("\\", "\\\\");
+	if (s.includes("'") && !s.includes('"')) {
+		quote = '"';
+	} else if (s.includes("'")) {
+		body = body.replaceAll("'", "\\'");
+	}
+	return quote + body + quote;
+}
+
+/** Escape-drift refusals (Appendix B, verbatim modulo pi tool names per
+ * ledger #10 — read_file → read, old_string/new_string → the old/new text
+ * and our oldText/newText params — plus the transitional edit-#N-in-path
+ * context the multi-edit surface requires). Drift errors are intentional
+ * blocks: no "did you mean" hint is layered on top. */
+export function escapeDriftErrorMessage(path: string, editIndex: number, drift: EscapeDrift): string {
+	const where = `of edit #${editIndex} in ${path}`;
+	switch (drift.kind) {
+		case "quote_suspect":
+			return (
+				`Escape-drift detected: the old and new text ${where} contain the literal ` +
+				`sequence ${pyRepr(drift.suspect)} but the matched region of the file does ` +
+				`not. This is almost always a tool-call serialization artifact where an ` +
+				`apostrophe or quote got prefixed with a spurious backslash. Re-read the ` +
+				`file with read and pass oldText/newText without backslash-escaping ` +
+				`${pyRepr(drift.plain)} characters.`
+			);
+		case "newline_literal":
+			return (
+				`Escape-drift detected: the old text ${where} contains more literal ` +
+				`${pyRepr("\\n")} sequences than the matched region of the file, which has ` +
+				`real line breaks there instead. This is almost always a tool-call ` +
+				`serialization artifact where a line break got escaped one extra time; ` +
+				`the new text would write it as backslash + n. Re-read the file with ` +
+				`read and pass oldText/newText with actual line breaks, keeping only ` +
+				`the ${pyRepr("\\n")} sequences that appear literally in the file.`
+			);
+		case "backslash_doubling":
+			return (
+				`Escape-drift detected: every backslash run in the old text ${where} is ` +
+				`exactly twice as long as in the matched region of the file (e.g. the ` +
+				// hermes backticks these examples instead of using repr
+				"file has `\\\\` where the old text has `\\\\\\\\`). " +
+				`The tool-call arguments were JSON-escaped one extra time; applying the ` +
+				`new text verbatim would double every backslash in the file. Re-read the ` +
+				`file with read and resend oldText/newText with the backslash counts ` +
+				`exactly as they appear in the file.`
+			);
+	}
 }
 
 export { similarity };

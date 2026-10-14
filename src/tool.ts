@@ -32,6 +32,7 @@ import {
 	alreadyAppliedMessage,
 	ambiguityErrorMessage,
 	emptyOldTextError,
+	escapeDriftErrorMessage,
 	identicalTextsError,
 	noMatchErrorMessage,
 	overlapErrorMessage,
@@ -223,6 +224,8 @@ function applyPatchEdits(
 	for (let i = 0; i < edits.length; i++) {
 		const result = runChain(normalizedContent, edits[i].oldText, {
 			replaceAll: edits[i].replaceAll === true,
+			// Arms the escape-drift guards on non-exact matches (Tier 1 #3)
+			newText: edits[i].newText,
 		});
 		if (result.ok) {
 			matches[i] = result.match;
@@ -233,6 +236,7 @@ function applyPatchEdits(
 
 	if (failures.length > 0) {
 		const ambiguous = failures.find((f) => f.failure.kind === "ambiguous");
+		const drifted = failures.find((f) => f.failure.kind === "escape_drift");
 		const appliedIndexes: number[] = [];
 		const missedIndexes: number[] = [];
 		for (const f of failures) {
@@ -257,6 +261,10 @@ function applyPatchEdits(
 				failure.count,
 				failure.locations as MatchLocation[],
 			);
+		} else if (drifted) {
+			// Drift is an intentional block (hermes: no match hint on top of it)
+			const failure = drifted.failure as Extract<ChainFailure, { kind: "escape_drift" }>;
+			msg = escapeDriftErrorMessage(path, drifted.index + 1, failure.drift);
 		} else if (refusal) {
 			const failure = refusal.failure as Extract<ChainFailure, { kind: "replace_all_similarity" }>;
 			msg = replaceAllRefusalMessage(path, refusal.index + 1, failure.strategy, failure.count);
@@ -266,7 +274,9 @@ function applyPatchEdits(
 		}
 		const others = failures.length - 1;
 		if (others > 0) {
-			msg += `\n\n${others} other edit(s) in this call also failed to match; nothing was written.`;
+			// Failed to match OR was refused by a drift guard — either way it
+			// did not apply.
+			msg += `\n\n${others} other edit(s) in this call also failed to apply; nothing was written.`;
 		}
 		if (appliedIndexes.length > 0 && (ambiguous || missedIndexes.length > 0)) {
 			msg += `\n\nNote: edit ${appliedIndexes.map((i) => `#${i}`).join(", ")} appear${appliedIndexes.length === 1 ? "s" : ""} to be already applied — drop it from the call and re-send the rest.`;

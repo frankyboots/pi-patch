@@ -28,6 +28,8 @@ import {
 	type Span,
 } from "../src/span-map.js";
 import { reindentReplacement } from "../src/shaping.js";
+import { detectEscapeDrift } from "../src/escape-drift.js";
+import { escapeDriftErrorMessage } from "../src/errors.js";
 import { createPatchToolDefinition, prepareEditArguments } from "../src/tool.js";
 import { generateDiffString } from "../src/diff-utils.js";
 
@@ -95,10 +97,10 @@ describe("chain: strategy selection", () => {
 // ── hermes corpus port (tests/tools/test_fuzzy_match.py) ─────────────────
 //
 // Ported per docs/PLAN.md's validation bar. `fuzzyReplace` mirrors hermes'
-// fuzzy_find_and_replace: chain (replaceAll included, Tier 1 #2) + splice with
-// reindent shaping onto EACH region. Escape-drift guards (Tier 1 #3) and
-// unicode-preserving replacement opcodes (Tier 1 #4) land with those steps —
-// corpus cases needing them are ported there.
+// fuzzy_find_and_replace: chain (replaceAll included, Tier 1 #2) + escape-drift
+// guards on non-exact matches (Tier 1 #3) + splice with reindent shaping onto
+// EACH region. Unicode-preserving replacement opcodes (Tier 1 #4) land with
+// that step — corpus cases needing them are ported there.
 
 function fuzzyReplace(
 	content: string,
@@ -106,16 +108,19 @@ function fuzzyReplace(
 	newText: string,
 	opts: { replaceAll?: boolean } = {},
 ): { ok: true; out: string; count: number; strategy: string } | { ok: false; error: string } {
-	const r = runChain(content, oldText, opts);
+	const r = runChain(content, oldText, { ...opts, newText });
 	if (!r.ok) {
 		return {
 			ok: false,
 			error:
 				r.failure.kind === "ambiguous"
 					? `Found ${r.failure.count} matches for old_string.`
-					: r.failure.kind === "replace_all_similarity"
-						? "replace_all only applies to exact matches"
-						: "Could not find a match for old_string in the file",
+					: r.failure.kind === "escape_drift"
+						// hermes returns the raw drift text from the orchestrator
+						? escapeDriftErrorMessage("f", 1, r.failure.drift)
+						: r.failure.kind === "replace_all_similarity"
+							? "replace_all only applies to exact matches"
+							: "Could not find a match for old_string in the file",
 		};
 	}
 	// hermes _apply_replacements: splice end-to-start; non-exact matches are
@@ -287,7 +292,7 @@ describe("corpus: escape_normalized (hermes)", () => {
 
 	it("literal \\n in the pattern matches the file's real newline", () => {
 		// Matching side of TestNewlineLiteralDrift.test_drifted_line_break_rejected;
-		// the drift GUARD that blocks the write lands with Tier 1 #3.
+		// the drift GUARD that blocks the write is ported below (Tier 1 #3).
 		const content = 'def greet():\n    print("hi")\n';
 		const r = runChain(content, 'def greet():\\n    print("hi")');
 		expect(r.ok).toBe(true);
@@ -300,6 +305,193 @@ describe("corpus: escape_normalized (hermes)", () => {
 	it("is inert when the pattern has no escape sequences", () => {
 		expect(strategyEscapeNormalized("abc", "abc")).toEqual([]);
 		expect(strategyEscapeNormalized("a\\qb", "a\\qb")).toEqual([]);
+	});
+});
+
+describe("corpus: TestEscapeDriftGuard (hermes)", () => {
+	it("test_drift_blocked_apostrophe", () => {
+		// File has ', old/new both carry \' — classic tool-call drift. The guard
+		// must block with a helpful error instead of writing \' literals into
+		// source code (the match itself lands via line_trimmed).
+		const content = "line\n    x = 1\nline";
+		const r = fuzzyReplace(content, "line\n  x = \\'a\\'\nline", "line\n  x = \\'b\\'\nline");
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.error).toContain("Escape-drift");
+			expect(r.error.toLowerCase()).toContain("backslash");
+		}
+	});
+
+	it("test_drift_blocked_double_quote", () => {
+		// Same idea but with \" drift instead of \'
+		const content = "line\n    x = 1\nline";
+		const r = fuzzyReplace(content, 'line\n  x = \\"a\\"\nline', 'line\n  x = \\"b\\"\nline');
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.error).toContain("Escape-drift");
+	});
+
+	it("test_drift_allowed_when_file_genuinely_has_backslash_escapes", () => {
+		// The file already contains \' (existing escaped string) — the model is
+		// legitimately preserving it; the guard must NOT fire.
+		const content = "line\n  x = \\'a\\'\nline";
+		const r = fuzzyReplace(content, "line\n  x = \\'a\\'\nline", "line\n  x = \\'b\\'\nline");
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.count).toBe(1);
+			expect(r.out).toBe("line\n  x = \\'b\\'\nline");
+		}
+	});
+
+	it("test_drift_allowed_on_exact_match", () => {
+		// Exact matches bypass the drift guard entirely — if the file really
+		// contains the exact bytes oldText specified, it's not drift.
+		const content = "hello \\'world\\'";
+		const r = fuzzyReplace(content, "hello \\'world\\'", "hello \\'there\\'");
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.count).toBe(1);
+			expect(r.strategy).toBe("exact");
+			expect(r.out).toBe("hello \\'there\\'");
+		}
+	});
+
+	it("test_no_drift_check_when_new_string_lacks_suspect_chars", () => {
+		// Fast path: no \' or \" in newText and no backslash in oldText —
+		// the guard must not fire even on a fuzzy match.
+		const r = fuzzyReplace("def foo():\n    pass", "def foo():\n  pass", "def bar():\n  return 1");
+		expect(r.ok).toBe(true);
+		if (r.ok) expect(r.count).toBe(1);
+	});
+});
+
+describe("corpus: TestNewlineLiteralDrift (hermes)", () => {
+	it("test_drifted_line_break_rejected", () => {
+		// A line break escaped one extra time arrives as literal backslash + n;
+		// escape_normalized still matches it, but the guard blocks the write.
+		const content = 'def greet():\n    print("hi")\n';
+		const r = fuzzyReplace(
+			content,
+			'def greet():\\n    print("hi")',
+			'def greet():\\n    print("hello")',
+		);
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.error).toContain("Escape-drift");
+	});
+
+	it("test_legitimate_backslash_n_in_code_applies", () => {
+		// Non-exact match (indent differs) on code that really contains "\n":
+		// the file-side literal counts, so the guard stays silent.
+		const r = fuzzyReplace(
+			'def greet():\n    print("hi\\n")\n    return 1\n',
+			'def greet():\n  print("hi\\n")\n  return 1',
+			'def greet():\n  print("hello\\n")\n  return 1',
+		);
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.count).toBe(1);
+			expect(r.out).toContain('print("hello\\n")');
+		}
+	});
+
+	it("test_drift_next_to_legitimate_backslash_n_rejected", () => {
+		// One drifted line break plus a "\n" the code really has: the file-side
+		// literal must not mask the drifted one (context_aware lands this).
+		const r = fuzzyReplace(
+			'def greet():\n    message = build_greeting_message("hi\\n")\n    return message\n',
+			'def greet():\\n    message = build_greeting_message("hi\\n")\n    return message',
+			'def greet():\\n    message = build_greeting_message("hello\\n")\n    return message',
+		);
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.error).toContain("Escape-drift");
+	});
+
+	it("test_drift_rejected_under_replace_all", () => {
+		// Regions are compared one by one — joining them would multiply the
+		// file-side literal count.
+		const r = fuzzyReplace(
+			"x = 1\ny = 2\n\nx = 1\ny = 2\n",
+			"x = 1\\ny = 2",
+			"x = 1\\ny = 3",
+			{ replaceAll: true },
+		);
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.error).toContain("Escape-drift");
+	});
+});
+
+describe("escape-drift: guard units (hermes _detect_escape_drift)", () => {
+	const whole = (content: string): Span[] => [{ start: 0, end: content.length }];
+
+	it("backslash doubling fires only when every run is exactly 2x the file's", () => {
+		const regions = "a\\\\b"; // one run of 2 in the file
+		const old = "a\\\\\\\\b"; // one run of 4 in oldText
+		expect(detectEscapeDrift(regions, whole(regions), old, "a\\\\\\\\c")).toEqual({
+			kind: "backslash_doubling",
+		});
+		// newText already matches the file's counts — nothing to fix
+		expect(detectEscapeDrift(regions, whole(regions), old, "a\\\\c")).toBeUndefined();
+		// 2x relation violated (3 is not 2*2)
+		expect(detectEscapeDrift(regions, whole(regions), "a\\\\\\\\\\\\b", "x")).toBeUndefined();
+		// trivial signal: a single run of 1 in the file
+		expect(detectEscapeDrift("a\\b", whole("a\\b"), "a\\\\b", "x")).toBeUndefined();
+		// non-trivial: 2+ runs, each exactly doubled
+		expect(detectEscapeDrift("a\\b", whole("a\\b"), "a\\\\b", "a\\\\\\\\b")).toBeUndefined();
+	});
+
+	it("quote suspects need both strings, and must be absent from the file", () => {
+		// suspect only in newText — an edit that ADDS an escaped quote is legit
+		expect(detectEscapeDrift("x = 1", whole("x = 1"), "x = 1", "x = \\'2\\'")).toBeUndefined();
+		// file genuinely has the sequence — no drift
+		expect(detectEscapeDrift("x = \\'1\\'", whole("x = \\'1\\'"), "x = \\'1\\'", "x = \\'2\\'")).toBeUndefined();
+		// both strings carry it, file doesn't → drift
+		expect(detectEscapeDrift("x = '1'", whole("x = '1'"), "x = \\'1\\'", "x = \\'2\\'")).toEqual({
+			kind: "quote_suspect",
+			suspect: "\\'",
+			plain: "'",
+		});
+	});
+
+	it("newline-literal guard: needs a literal in newText and a real break in the region", () => {
+		// no literal \n in newText → never drift
+		expect(detectEscapeDrift("a\nb", whole("a\nb"), "a\nb", "a\nc")).toBeUndefined();
+		// region has no real newline → nothing for the literal to stand in for
+		expect(detectEscapeDrift("a\\nb", whole("a\\nb"), "a\\nb", "a\\nc")).toBeUndefined();
+		// the drifted case
+		expect(detectEscapeDrift("a\nb", whole("a\nb"), "a\\nb", "a\\nc")).toEqual({
+			kind: "newline_literal",
+		});
+	});
+});
+
+describe("escape-drift: teaching texts (Appendix B)", () => {
+	// Byte-exact against the JSON-probed hermes messages, modulo the pi tool
+	// name (read_file → read), param names (old_string/new_string → the old/new
+	// text and our oldText/newText params), and the edit-#N-in-path context
+	// (ledger #10 + the transitional multi-edit surface).
+	it("quote-suspect message keeps hermes' repr formatting", () => {
+		const msg = escapeDriftErrorMessage("f.py", 1, { kind: "quote_suspect", suspect: "\\'", plain: "'" });
+		expect(msg).toBe(
+			String.raw`Escape-drift detected: the old and new text of edit #1 in f.py contain the literal sequence "\\'" but the matched region of the file does not. This is almost always a tool-call serialization artifact where an apostrophe or quote got prefixed with a spurious backslash. Re-read the file with read and pass oldText/newText without backslash-escaping "'" characters.`,
+		);
+		const dquote = escapeDriftErrorMessage("f.py", 1, { kind: "quote_suspect", suspect: '\\"', plain: '"' });
+		expect(dquote).toContain(String.raw`sequence '\\"'`);
+		expect(dquote).toContain(String.raw`escaping '"' characters.`);
+	});
+
+	it("newline-literal message keeps hermes' repr formatting", () => {
+		const msg = escapeDriftErrorMessage("f.py", 2, { kind: "newline_literal" });
+		expect(msg).toBe(
+			String.raw`Escape-drift detected: the old text of edit #2 in f.py contains more literal '\\n' sequences than the matched region of the file, which has real line breaks there instead. This is almost always a tool-call serialization artifact where a line break got escaped one extra time; the new text would write it as backslash + n. Re-read the file with read and pass oldText/newText with actual line breaks, keeping only the '\\n' sequences that appear literally in the file.`,
+		);
+	});
+
+	it("backslash-doubling message keeps hermes' backtick examples", () => {
+		const msg = escapeDriftErrorMessage("f.py", 1, { kind: "backslash_doubling" });
+		expect(msg).toBe(
+			String.raw`Escape-drift detected: every backslash run in the old text of edit #1 in f.py is exactly twice as long as in the matched region of the file (e.g. the file has ` +
+				"`\\\\` where the old text has `\\\\\\\\`)." +
+				String.raw` The tool-call arguments were JSON-escaped one extra time; applying the new text verbatim would double every backslash in the file. Re-read the file with read and resend oldText/newText with the backslash counts exactly as they appear in the file.`,
+		);
 	});
 });
 
@@ -656,6 +848,49 @@ describe("tool: execute against real files", () => {
 		await expect(
 			run({ path: name, edits: [{ oldText: "   ", newText: "x" }] }, dir),
 		).rejects.toThrow(/whitespace-only|empty/);
+	});
+
+	it("escape-drift errors block the write and teach the fix", async () => {
+		// A line break escaped one extra time: escape_normalized matches, the
+		// guard refuses, and the file is untouched.
+		const { dir, file, name } = await tmpFile('def greet():\n    print("hi")\n');
+		await expect(
+			run(
+				{
+					path: name,
+					edits: [
+						{
+							oldText: 'def greet():\\n    print("hi")',
+							newText: 'def greet():\\n    print("hello")',
+						},
+					],
+				},
+				dir,
+			),
+		).rejects.toThrow(/Escape-drift detected[\s\S]*backslash \+ n/);
+		expect(await fs.readFile(file, "utf-8")).toBe('def greet():\n    print("hi")\n');
+	});
+
+	it("mixed call: drift refusal names its edit and reports the other failure", async () => {
+		const { dir, file, name } = await tmpFile('def greet():\n    print("hi")\n');
+		await expect(
+			run(
+				{
+					path: name,
+					edits: [
+						{
+							oldText: 'def greet():\\n    print("hi")',
+							newText: 'def greet():\\n    print("hello")',
+						},
+						{ oldText: "totally absent text", newText: "x" },
+					],
+				},
+				dir,
+			),
+		).rejects.toThrow(
+			/Escape-drift detected[\s\S]*edit #1[\s\S]*other edit\(s\) in this call also failed to apply/,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe('def greet():\n    print("hi")\n');
 	});
 });
 
