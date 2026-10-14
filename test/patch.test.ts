@@ -73,6 +73,7 @@ import {
 import { countOccurrences } from "../src/text.js";
 import {
 	applyReplacement,
+	computePatchDiff,
 	createPatchToolDefinition,
 	preparePatchArguments,
 } from "../src/tool.js";
@@ -990,6 +991,78 @@ describe("render: TUI shell (dogfood: box was ragged on the right, double-padded
 		expect(visibleWidth(lines[header - 1] ?? "")).toBe(WIDTH);
 		expect(visibleWidth(lines[header + 1] ?? "")).toBe(WIDTH);
 		expect(lines.length).toBe(4); // + box bottom pad — nothing else is padded yet
+	});
+});
+
+describe("render: already-applied no-op preview (dogfood: header painted toolErrorBg on a success-shaped no-op)", () => {
+	// docs/DOGFOOD.md: a call whose new_string is already in the file settles
+	// SUCCESS-shaped in execute(), but computePatchDiff returned { error: … } so
+	// renderCall painted the header box with toolErrorBg. computePatchDiff now
+	// returns a { note } outcome and the header must paint exactly like a real
+	// diff preview — never like a miss.
+	const WIDTH = 110;
+
+	/** Render a fully settled call box (async preview included) as lines. */
+	async function settledBoxLines(dir: string, args: Record<string, unknown>): Promise<string[]> {
+		initTheme("dark", false);
+		const definition = { ...createPatchToolDefinition(dir), ...patchRenderers };
+		const component = new ToolExecutionComponent(
+			"patch",
+			"tc-noop",
+			args,
+			{ outputPad: 1 },
+			definition as never,
+			{ requestRender: () => {} } as never,
+			dir,
+		);
+		component.setArgsComplete();
+		component.render(WIDTH); // kicks off the async preview
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		return component.render(WIDTH).filter((line) => visibleWidth(line) > 0);
+	}
+
+	/** The 48-series SGR the settled box paints its lines with. */
+	function boxBgSeq(lines: string[]): string {
+		const seq = (lines[0] ?? "").match(/\u001b\[48;[0-9;]+m/)?.[0] ?? "";
+		expect(seq).not.toBe("");
+		return seq;
+	}
+
+	let dir: string;
+	beforeEach(async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-noop-preview-"));
+		await fs.writeFile(path.join(dir, "f.py"), "value = 42\nsecond line\n");
+	});
+
+	it("computePatchDiff returns a note, not an error, for the already-applied no-op", async () => {
+		const preview = await computePatchDiff("f.py", { oldString: "zzz = 41", newString: "value = 42", replaceAll: false }, dir);
+		expect("note" in preview).toBe(true);
+		expect("error" in preview).toBe(false);
+		if ("note" in preview) expect(preview.note).toContain("already applied");
+	});
+
+	it("computePatchDiff still returns an error for a genuine miss", async () => {
+		const preview = await computePatchDiff(
+			"f.py",
+			{ oldString: "completely absent text here", newString: "and nothing balances this zzz", replaceAll: false },
+			dir,
+		);
+		expect("error" in preview).toBe(true);
+		expect("note" in preview).toBe(false);
+	});
+
+	it("paints the settled no-op header like a diff preview, not like a miss", async () => {
+		const noop = await settledBoxLines(dir, { path: "f.py", old_string: "zzz = 41", new_string: "value = 42" });
+		const diff = await settledBoxLines(dir, { path: "f.py", old_string: "second line", new_string: "second line!" });
+		const miss = await settledBoxLines(dir, { path: "f.py", old_string: "completely absent text here", new_string: "and nothing balances this zzz" });
+
+		// The no-op header background must equal the success-painted diff header,
+		// and the miss must genuinely paint differently (guards the comparison).
+		expect(boxBgSeq(noop)).toBe(boxBgSeq(diff));
+		expect(boxBgSeq(miss)).not.toBe(boxBgSeq(diff));
+		// The note text shows in the body — neutrally, as hermes' message.
+		expect(noop.join("\n")).toContain("already applied");
+		expect(miss.join("\n")).toContain("Could not find");
 	});
 });
 

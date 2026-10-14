@@ -22,7 +22,13 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { computePatchDiff, preparePatchArguments, type Replacement } from "./tool.js";
 import { describeV4AHeaderPaths } from "./v4a-fs.js";
 
-type PatchPreview = { diff: string; firstChangedLine?: number } | { error: string };
+/**
+ * Preview outcomes, mirroring how execute() settles the same call: a real
+ * `diff`, a `note` (a change the tool settles success-shaped without writing —
+ * the already-applied guard; dogfood: painting it as `error` made a successful
+ * no-op render as a failure), or an `error` (a miss execute() would throw).
+ */
+type PatchPreview = { diff: string; firstChangedLine?: number } | { note: string } | { error: string };
 
 type PatchCallRenderComponent = Box & {
 	preview?: PatchPreview;
@@ -135,19 +141,24 @@ function buildCallComponent(
 	const body =
 		"error" in component.preview
 			? theme.fg("error", component.preview.error)
-			: renderDiffBody(component.preview.diff, theme);
+			: "note" in component.preview
+				? // Success-shaped no-op: show hermes' message, neutrally — never in error red.
+					theme.fg("toolDiffContext", component.preview.note)
+				: renderDiffBody(component.preview.diff, theme);
 	component.addChild(new Text(body, 0, 0));
 	return component;
 }
 
+/** Comparable identity of a preview outcome across all three variants. */
+function previewSignature(preview: PatchPreview): string {
+	if ("error" in preview) return `error\0${preview.error}`;
+	if ("note" in preview) return `note\0${preview.note}`;
+	return `diff\0${preview.diff}\0${preview.firstChangedLine ?? ""}`;
+}
+
 function setPreview(component: PatchCallRenderComponent, preview: PatchPreview, argsKey: string): boolean {
 	const current = component.preview;
-	const changed =
-		current === undefined ||
-		("error" in current && "error" in preview ? current.error !== preview.error : "error" in current !== "error" in preview) ||
-		(!("error" in current) &&
-			!("error" in preview) &&
-			(current.diff !== preview.diff || current.firstChangedLine !== preview.firstChangedLine));
+	const changed = current === undefined || previewSignature(current) !== previewSignature(preview);
 	component.preview = preview;
 	component.previewArgsKey = argsKey;
 	component.previewPending = false;
@@ -223,7 +234,7 @@ export const patchRenderers = {
 				output = theme.fg("error", errorText);
 			}
 		} else {
-			const previewDiff = callComponent?.preview && !("error" in callComponent.preview) ? callComponent.preview.diff : undefined;
+			const previewDiff = callComponent?.preview && "diff" in callComponent.preview ? callComponent.preview.diff : undefined;
 			if (resultDiff && resultDiff !== previewDiff) {
 				output = renderDiffBody(resultDiff, theme);
 			}

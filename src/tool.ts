@@ -614,19 +614,30 @@ export function createPatchToolDefinition(
  * Compute the diff a patch would produce without applying it — the TUI preview.
  * Runs the same chain and shaping as execute(), so the preview can never
  * diverge from what gets written.
+ *
+ * Outcomes mirror execute()'s settlement: a real diff, an `error` (a miss or
+ * gate that execute() would throw on), or a `note` for the already-applied
+ * no-op — which execute() settles SUCCESS-shaped, so the preview must not
+ * report it as an error (docs/DOGFOOD.md: the header painted toolErrorBg on a
+ * call that succeeded).
  */
 export async function computePatchDiff(
 	path: string,
 	replacement: Replacement,
 	cwd: string,
-): Promise<{ diff: string; firstChangedLine?: number } | { error: string }> {
+): Promise<{ diff: string; firstChangedLine?: number } | { note: string } | { error: string }> {
 	try {
 		const absolutePath = resolveToCwd(path, cwd);
 		const raw = await fsReadFile(absolutePath, "utf-8");
 		const { text: content } = splitBom(raw);
 		const normalizedContent = normalizeToLF(content);
 		const applied = applyReplacement(normalizedContent, replacement, path);
-		if (!applied.ok) return { error: applied.errorMessage };
+		if (!applied.ok) {
+			// The already-applied guard is a success-shaped no-op in execute();
+			// surface it as a note so the preview header paints as success too.
+			if (applied.alreadyApplied) return { note: applied.errorMessage };
+			return { error: applied.errorMessage };
+		}
 		const diffResult = generateDiffString(normalizedContent, applied.newContent);
 		return { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine };
 	} catch (error) {
