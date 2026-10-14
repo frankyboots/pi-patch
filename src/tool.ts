@@ -22,25 +22,18 @@ import { Type } from "typebox";
 import { withFileMutationQueue, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from "./text.js";
 import { recordPatchFailure, resetPatchFailures } from "./failure-tracker.js";
-import { runChain, type ChainFailure, type StrategyName } from "./chain.js";
-import { applyReplacements, maybeUnescapeNewString, unicodeEditPlan } from "./shaping.js";
+import { fuzzyFindAndReplace, isAlreadyApplied, type StrategyName } from "./chain.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
 import {
 	alreadyAppliedMessage,
-	ambiguityErrorMessage,
-	emptyOldStringError,
-	escapeDriftErrorMessage,
 	failureEscalationHint,
+	formatNoMatchHint,
 	genericNoMatchHint,
-	identicalStringsError,
 	missingPathError,
 	missingReplacementError,
 	multiEditRefusalError,
-	noMatchErrorMessage,
 	patchModeUnavailableError,
-	replaceAllRefusalMessage,
 	unknownModeError,
-	whitespaceOnlyOldStringError,
 } from "./errors.js";
 
 /**
@@ -99,9 +92,6 @@ export interface PatchToolDetails {
 	/** Line number of the first change in the new file (for editor navigation) */
 	firstChangedLine?: number;
 }
-
-/** Non-blank length threshold for the already-applied no-op guard (conservative by design — see docs/PLAN.md status snapshot). */
-const ALREADY_APPLIED_MIN_CHARS = 8;
 
 export const patchToolSystemPromptContribution = {
 	snippet: "Find a unique region of text in one file and replace it, with fuzzy (9-strategy) matching",
@@ -244,32 +234,6 @@ function resolveToCwd(filePath: string, cwd: string): string {
 	return nodePath.isAbsolute(filePath) ? nodePath.normalize(filePath) : nodePath.resolve(cwd, filePath);
 }
 
-/** hermes `is_already_applied`: new_string non-trivial (≥ 8 non-blank chars) and
- * present EXACTLY, old_string gone. Conservative so it can never mask a real
- * partial application. */
-function isAlreadyApplied(content: string, oldString: string, newString: string): boolean {
-	if (!newString || newString.trim().length < ALREADY_APPLIED_MIN_CHARS) return false;
-	if (!content.includes(newString)) return false;
-	return oldString === newString || !content.includes(oldString);
-}
-
-/** Chain failure → teaching error (hermes `_no_match_result` ordering: the
- * already-applied check comes first, because the single most common production
- * failure is a re-send of an edit that already landed). */
-function failureMessage(failure: ChainFailure, content: string, replacement: Replacement): string {
-	switch (failure.kind) {
-		case "ambiguous":
-			return ambiguityErrorMessage(failure.count, failure.locations);
-		case "escape_drift":
-			// Intentional block: no "did you mean" hint is layered on top.
-			return escapeDriftErrorMessage(failure.drift);
-		case "replace_all_similarity":
-			return replaceAllRefusalMessage(failure.count, failure.strategy);
-		case "no_match":
-			return noMatchErrorMessage(content, replacement.oldString);
-	}
-}
-
 export type ReplacementOutcome =
 	| { ok: true; newContent: string; replacements: number; strategy: StrategyName }
 	/** `alreadyApplied` results are success-shaped: no write, no error. */
@@ -304,7 +268,12 @@ function attachNoMatchEscalation(errorMessage: string, trackerKey: string, displ
 /**
  * Pure core shared by execute() and the TUI preview: validate, run the chain,
  * then shape and splice — hermes' `fuzzy_find_and_replace` and its
- * orchestrator tail in one pass over LF-normalized content.
+ * orchestrator tail in one pass over LF-normalized content. Error shaping
+ * follows hermes `patch_replace`/`_no_match_result`: the already-applied
+ * no-op gates EVERY orchestrator error (the single most common production
+ * failure is a re-send of an edit that already landed), then the "did you
+ * mean" hint attaches to plain no-match errors only (`formatNoMatchHint`'s
+ * own gate).
  */
 export function applyReplacement(
 	content: string,
@@ -312,30 +281,14 @@ export function applyReplacement(
 	path: string,
 ): ReplacementOutcome {
 	const { oldString, newString, replaceAll } = replacement;
-	// hermes' argument validation inside the orchestrator, before the chain.
-	if (!oldString) return { ok: false, errorMessage: emptyOldStringError() };
-	if (!oldString.trim()) return { ok: false, errorMessage: whitespaceOnlyOldStringError() };
-	if (oldString === newString) return { ok: false, errorMessage: identicalStringsError() };
-
-	const result = runChain(content, oldString, { replaceAll, newText: newString });
-	if (!result.ok) {
+	const { newContent, count, strategy, error } = fuzzyFindAndReplace(content, oldString, newString, replaceAll);
+	if (error) {
 		if (isAlreadyApplied(content, oldString, newString)) {
 			return { ok: false, alreadyApplied: true, errorMessage: alreadyAppliedMessage(path) };
 		}
-		return { ok: false, errorMessage: failureMessage(result.failure, content, replacement) };
+		return { ok: false, errorMessage: error + formatNoMatchHint(error, 0, oldString, content) };
 	}
-
-	// hermes orchestrator tail: effective_new = conditional \t/\r unescape over
-	// the matched regions (ALL strategies including exact — issue #33733), then
-	// _apply_replacements: unicode opcodes (unicode_normalized match) + reindent
-	// onto EACH region's depth, spliced end-to-start.
-	const { spans, strategy, exact } = result.match;
-	const effectiveNew = maybeUnescapeNewString(newString, content, spans);
-	const newContent = applyReplacements(content, spans, effectiveNew, {
-		oldText: exact ? undefined : oldString,
-		unicodePlan: strategy === "unicode_normalized" ? unicodeEditPlan(oldString, effectiveNew) : undefined,
-	});
-	return { ok: true, newContent, replacements: spans.length, strategy };
+	return { ok: true, newContent, replacements: count, strategy: strategy as StrategyName };
 }
 
 const defaultEditOperations = {

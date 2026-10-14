@@ -22,16 +22,22 @@
  *   map spans back with the span-map algebra, so the matched file bytes — not
  *   the pattern's — drive the replacement.
  *
- * `runChain` is the orchestrator path (hermes' `fuzzy_find_and_replace`):
- * single-replacement semantics by default, `replaceAll` over every match of
- * the winning strategy (Tier 1 #2), and the escape-drift guards on every
- * non-exact match (Tier 1 #3) — hermes runs them inside the orchestrator,
- * before anything is written. The orchestrator tail (conditional \t/\r
- * unescape, unicode-preserving opcodes, reindent, splice) lives in
- * `shaping.ts` + the tool layer (Tier 1 #4).
+ * `runChain` is the strategy sweep: single-replacement semantics by default,
+ * `replaceAll` over every match of the winning strategy (Tier 1 #2), and the
+ * escape-drift guards on every non-exact match (Tier 1 #3) — hermes runs
+ * them inside the orchestrator, before anything is written. `fuzzyFindAndReplace`
+ * is hermes' full `fuzzy_find_and_replace` on top of it — argument gates,
+ * chain, then the orchestrator tail (conditional \t/\r unescape,
+ * unicode-preserving opcodes, reindent, splice from `shaping.ts`) — shared by
+ * BOTH surfaces: replace mode (`tool.ts`) and the V4A patch mode's Update
+ * hunks (`v4a.ts`, Tier 3 #8). Its error strings are hermes' Appendix B texts
+ * verbatim, WITHOUT the "did you mean" hint — that layer belongs to the
+ * callers (`formatNoMatchHint`), exactly as in hermes.
  */
 import { buildLineIndex, lineAt, similarity, type LineIndex } from "./text.js";
 import { detectEscapeDrift, type EscapeDrift } from "./escape-drift.js";
+import { ambiguityErrorMessage, emptyOldStringError, escapeDriftErrorMessage, identicalStringsError, replaceAllRefusalMessage, whitespaceOnlyOldStringError } from "./errors.js";
+import { applyReplacements, maybeUnescapeNewString, unicodeEditPlan } from "./shaping.js";
 import {
 	buildOrigToNormMap,
 	collapseWhitespace,
@@ -308,4 +314,89 @@ export function runChain(content: string, oldText: string, options: RunChainOpti
 		return { ok: true, match: { strategy: name, spans, exact: name === "exact" } };
 	}
 	return { ok: false, failure: { kind: "no_match" } };
+}
+
+// ── Orchestrator (hermes fuzzy_find_and_replace) ─────────────────────────
+
+/** Conservative already-applied bar (hermes): new_string must be non-trivial
+ * (≥ 8 non-blank chars) and present EXACTLY, old_string gone. It gates EVERY
+ * orchestrator failure in the replace surface (hermes `_no_match_result`
+ * checks it before formatting any error) and every failed Update hunk in V4A
+ * validation/apply — it must never mask a real partial application. */
+const ALREADY_APPLIED_MIN_CHARS = 8;
+
+/** hermes `is_already_applied` (fuzzy_match.py:307). */
+export function isAlreadyApplied(content: string, oldString: string, newString: string): boolean {
+	if (!newString || newString.trim().length < ALREADY_APPLIED_MIN_CHARS) return false;
+	if (!content.includes(newString)) return false;
+	return oldString === newString || !content.includes(oldString);
+}
+
+/** Chain failure → hermes' orchestrator error text, WITHOUT the "did you
+ * mean" hint (hermes' fuzzy_find_and_replace returns the bare texts; callers
+ * attach the hint — see `formatNoMatchHint`). */
+function chainFailureMessage(failure: ChainFailure): string {
+	switch (failure.kind) {
+		case "ambiguous":
+			return ambiguityErrorMessage(failure.count, failure.locations);
+		case "escape_drift":
+			return escapeDriftErrorMessage(failure.drift);
+		case "replace_all_similarity":
+			return replaceAllRefusalMessage(failure.count, failure.strategy);
+		case "no_match":
+			return "Could not find a match for old_string in the file";
+	}
+}
+
+export interface FuzzyReplaceResult {
+	/** Content after the replacement — identical to the input on failure. */
+	newContent: string;
+	/** Number of regions spliced (0 on failure). */
+	count: number;
+	/** Winning strategy (null on failure). */
+	strategy: StrategyName | null;
+	/** hermes' orchestrator error text (null on success). */
+	error: string | null;
+}
+
+/**
+ * hermes `fuzzy_find_and_replace` (fuzzy_match.py:338) — the shared matching
+ * entry for both surfaces. Returns `(new_content, count, strategy, error)`:
+ * hermes' argument gates (empty / whitespace-only / identical old_string),
+ * then the chain, then the shaping tail. On failure the input content comes
+ * back unchanged with `count === 0`; the already-applied check is the
+ * CALLER's (hermes' replace surface does it in `_no_match_result`, V4A in its
+ * validate/apply hunk loops).
+ */
+export function fuzzyFindAndReplace(
+	content: string,
+	oldString: string,
+	newString: string,
+	replaceAll = false,
+): FuzzyReplaceResult {
+	// hermes' argument validation inside the orchestrator, before the chain.
+	if (!oldString) {
+		return { newContent: content, count: 0, strategy: null, error: emptyOldStringError() };
+	}
+	if (!oldString.trim()) {
+		return { newContent: content, count: 0, strategy: null, error: whitespaceOnlyOldStringError() };
+	}
+	if (oldString === newString) {
+		return { newContent: content, count: 0, strategy: null, error: identicalStringsError() };
+	}
+	const result = runChain(content, oldString, { replaceAll, newText: newString });
+	if (!result.ok) {
+		return { newContent: content, count: 0, strategy: null, error: chainFailureMessage(result.failure) };
+	}
+	// Orchestrator tail: effective_new = conditional \t/\r unescape over the
+	// matched regions (ALL strategies including exact — issue #33733), then
+	// _apply_replacements: unicode opcodes (unicode_normalized match) + reindent
+	// onto EACH region's depth, spliced end-to-start.
+	const { spans, strategy, exact } = result.match;
+	const effectiveNew = maybeUnescapeNewString(newString, content, spans);
+	const newContent = applyReplacements(content, spans, effectiveNew, {
+		oldText: exact ? undefined : oldString,
+		unicodePlan: strategy === "unicode_normalized" ? unicodeEditPlan(oldString, effectiveNew) : undefined,
+	});
+	return { newContent, count: spans.length, strategy, error: null };
 }

@@ -1,15 +1,16 @@
 /**
  * pi-patch test corpus — the acceptance bar in docs/PLAN.md: the strategy
  * chain, per-strategy uniqueness counting, replacement shaping, teaching-error
- * fidelity (hermes Appendix B texts), and the tool-level file behaviors of the
+ * fidelity (hermes Appendix B texts), the tool-level file behaviors of the
  * single-replacement surface (path + old_string + new_string + replace_all):
- * CRLF/BOM, already-applied no-op, argument normalization, hermes' arg gates.
+ * CRLF/BOM, already-applied no-op, argument normalization, hermes' arg gates —
+ * and the V4A patch mode (test_patch_parser.py corpora, Tier 3 #8).
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -40,6 +41,16 @@ import {
 } from "../src/shaping.js";
 import { detectEscapeDrift } from "../src/escape-drift.js";
 import { clearPatchFailures, recordPatchFailure, resetPatchFailures } from "../src/failure-tracker.js";
+import {
+	applyV4AOperations,
+	applyV4APatch,
+	parseV4APatch,
+	type PatchResult,
+	type RawReadResult,
+	type V4AFileOps,
+	type V4AWriteResult,
+} from "../src/v4a.js";
+import { countOccurrences } from "../src/text.js";
 import {
 	applyReplacement,
 	createPatchToolDefinition,
@@ -1712,4 +1723,804 @@ describe("span-map: golden differential vs hermes fuzzy_match.py", () => {
 			}
 		});
 	}
+});
+
+// ── V4A patch mode (patch_parser port, Tier 3 #8) ────────────────────────
+
+/** hermes tests' `_DictFileOps`: in-memory file_ops backing store supporting
+ * update/move/delete/add. */
+class DictFileOps implements V4AFileOps {
+	readonly files = new Map<string, string>();
+	constructor(files: Record<string, string> = {}) {
+		for (const [p, c] of Object.entries(files)) this.files.set(p, c);
+	}
+	readFileRaw(p: string): RawReadResult {
+		if (this.files.has(p)) return { content: this.files.get(p) as string, error: null };
+		return { content: "", error: "file not found", notFound: true };
+	}
+	writeFile(p: string, content: string): V4AWriteResult {
+		this.files.set(p, content);
+		return { error: null };
+	}
+	moveFile(src: string, dst: string): { error: string | null } {
+		const content = this.files.get(src);
+		if (content === undefined) return { error: `file not found: ${src}` };
+		this.files.delete(src);
+		this.files.set(dst, content);
+		return { error: null };
+	}
+	deleteFile(p: string): { error: string | null } {
+		this.files.delete(p);
+		return { error: null };
+	}
+}
+
+function parse(patch: string) {
+	const { operations, error } = parseV4APatch(patch);
+	expect(error).toBeUndefined();
+	return operations;
+}
+
+function expectParseError(patch: string): string {
+	const { operations, error } = parseV4APatch(patch);
+	expect(operations).toEqual([]);
+	expect(error).toBeDefined();
+	return error as string;
+}
+
+function applyOk(ops: ReturnType<typeof parse>, fo: V4AFileOps): PatchResult {
+	const result = applyV4AOperations(ops, fo);
+	expect(result.error ?? "(no error)").toBe("(no error)");
+	expect(result.success).toBe(true);
+	return result;
+}
+
+describe("V4A parse: hermes test_patch_parser corpora", () => {
+	it("parses a basic Update op with hint and mixed prefixes", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: src/main.py
+@@ def greet @@
+ def greet():
+-    print("hello")
++    print("hi")
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		const op = ops[0];
+		expect(op.operation).toBe("update");
+		expect(op.filePath).toBe("src/main.py");
+		expect(op.hunks.length).toBe(1);
+		const hunk = op.hunks[0];
+		expect(hunk.contextHint).toBe("def greet");
+		const prefixes = hunk.lines.map((l) => l.prefix);
+		expect(prefixes).toContain(" ");
+		expect(prefixes).toContain("-");
+		expect(prefixes).toContain("+");
+	});
+
+	it("parses multiple hunks with their own hints", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: f.py
+@@ first @@
+ a
+-b
++c
+@@ second @@
+ x
+-y
++z
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		expect(ops[0].hunks.length).toBe(2);
+		expect(ops[0].hunks[0].contextHint).toBe("first");
+		expect(ops[0].hunks[1].contextHint).toBe("second");
+	});
+
+	it("parses an Add op with blank + lines kept", () => {
+		const ops = parse(`*** Begin Patch
+*** Add File: new/module.py
++import os
++
++print("hello")
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		const op = ops[0];
+		expect(op.operation).toBe("add");
+		expect(op.filePath).toBe("new/module.py");
+		expect(op.hunks.length).toBe(1);
+		const contents = ops[0].hunks[0].lines.filter((l) => l.prefix === "+").map((l) => l.content);
+		expect(contents[0]).toBe("import os");
+		expect(contents[2]).toBe('print("hello")');
+	});
+
+	it("parses a Delete op", () => {
+		const ops = parse(`*** Begin Patch
+*** Delete File: old/stuff.py
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		expect(ops[0]).toMatchObject({ operation: "delete", filePath: "old/stuff.py" });
+	});
+
+	it("parses a Move op with both endpoints", () => {
+		const ops = parse(`*** Begin Patch
+*** Move File: old/path.py -> new/path.py
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		expect(ops[0]).toMatchObject({ operation: "move", filePath: "old/path.py", newPath: "new/path.py" });
+	});
+
+	it("keeps an End Patch marker mentioned inside Add content (no truncation)", () => {
+		const ops = parse(`*** Begin Patch
+*** Add File: notes.md
++doc line one
++*** End Patch
++content after the marker mention
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		const contents = ops[0].hunks[0].lines.filter((l) => l.prefix === "+").map((l) => l.content);
+		expect(contents).toEqual([
+			"doc line one",
+			"*** End Patch",
+			"content after the marker mention",
+		]);
+	});
+
+	it("keeps a Begin Patch marker mentioned inside Add content (no discarded ops)", () => {
+		const ops = parse(`*** Begin Patch
+*** Add File: first.md
++first file content
+*** Add File: second.md
++*** Begin Patch
++second file content
+*** End Patch`);
+		expect(ops.map((op) => [op.operation, op.filePath])).toEqual([
+			["add", "first.md"],
+			["add", "second.md"],
+		]);
+	});
+
+	it("keeps an End Patch marker as a context line (no truncation)", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: guide.md
+@@ section @@
+ old line
+ *** End Patch
++new line
+*** End Patch`);
+		expect(ops.length).toBe(1);
+		const hunkLines = ops[0].hunks[0].lines.map((l) => [l.prefix, l.content]);
+		expect(hunkLines).toContainEqual([" ", "*** End Patch"]);
+		expect(hunkLines).toContainEqual(["+", "new line"]);
+	});
+
+	it("empty patch returns empty ops, no error", () => {
+		const { operations, error } = parseV4APatch("");
+		expect(error).toBeUndefined();
+		expect(operations).toEqual([]);
+	});
+
+	it("parses multiple operations in order", () => {
+		const ops = parse(`*** Begin Patch
+*** Add File: a.py
++content_a
+*** Delete File: b.py
+*** Update File: c.py
+ keep
+-remove
++add
+*** End Patch`);
+		expect(ops.length).toBe(3);
+		expect(ops.map((op) => op.operation)).toEqual(["add", "delete", "update"]);
+	});
+
+	it("UPDATE with no hunks is a parse error", () => {
+		expectParseError(`*** Begin Patch
+*** Update File: foo.py
+*** End Patch`);
+	});
+
+	it("a well-formed patch parses without error", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: f.py
+ ctx
+-old
++new
+*** End Patch`);
+		expect(ops.length).toBe(1);
+	});
+
+	it("empty file path and hunk-less UPDATE parse errors accumulate", () => {
+		// '*** Update File:  ' — the marker's (.+) captures a space, stripped to ""
+		expect(expectParseError("*** Begin Patch\n*** Update File:  \n*** End Patch")).toBe(
+			"Parse error: Operation with empty file path; UPDATE '': no hunks found",
+		);
+	});
+
+	it("MOVE with a whitespace destination is a parse error", () => {
+		expect(expectParseError("*** Begin Patch\n*** Move File: a.py -> \n*** End Patch")).toBe(
+			"Parse error: MOVE 'a.py': missing destination path (expected 'src -> dst')",
+		);
+	});
+
+	it("counts occurrences with overlaps (hermes _count_occurrences)", () => {
+		// The shared helper the addition-only hint checks ride on: advancing one
+		// char per hit means overlapping matches each count.
+		expect(countOccurrences("aaa", "a")).toBe(3);
+		expect(countOccurrences("aaa", "aa")).toBe(2);
+		expect(countOccurrences("hello world", "xyz")).toBe(0);
+		expect(countOccurrences("", "x")).toBe(0);
+	});
+});
+
+describe("V4A apply: hermes test_patch_parser corpora", () => {
+	it("preserves non-prefix pipe characters in unmodified lines", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: sample.py
+@@ result @@
+    result = 1
+-    return result
++    return result + 1
+*** End Patch`);
+		const fo = new DictFileOps({
+			"sample.py": 'def run():\n    cmd = "echo a | sed s/a/b/"\n    result = 1\n    return result',
+		});
+		const result = applyOk(ops, fo);
+		expect(fo.files.get("sample.py")).toBe(
+			'def run():\n    cmd = "echo a | sed s/a/b/"\n    result = 1\n    return result + 1',
+		);
+		// The diff is Python difflib.unified_diff byte-for-byte (CPython 3.12,
+		// including the missing newline between the - and + rows on a file that
+		// lacks a trailing newline).
+		expect(result.diff).toBe(
+			'--- a/sample.py\n+++ b/sample.py\n@@ -1,4 +1,4 @@\n def run():\n     cmd = "echo a | sed s/a/b/"\n     result = 1\n-    return result+    return result + 1',
+		);
+	});
+
+	it("inserts an addition-only hunk after its context hint (#3081)", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: src/app.py
+@@ def main @@
++def helper():
++    return 42
+*** End Patch`);
+		// All lines should be additions
+		expect(ops[0].hunks[0].lines.every((l) => l.prefix === "+")).toBe(true);
+		const fo = new DictFileOps({ "src/app.py": "def main():\n    pass\n" });
+		applyOk(ops, fo);
+		const written = fo.files.get("src/app.py") as string;
+		expect(written).toContain("def helper():");
+		expect(written).toContain("return 42");
+		expect(written).toBe("def main():\ndef helper():\n    return 42\n    pass\n");
+	});
+
+	it("appends an addition-only hunk without a hint at end of file", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: src/app.py
++def new_func():
++    return True
+*** End Patch`);
+		const fo = new DictFileOps({ "src/app.py": "existing = True\n" });
+		applyOk(ops, fo);
+		const written = fo.files.get("src/app.py") as string;
+		expect(written.endsWith("def new_func():\n    return True\n")).toBe(true);
+		expect(written).toContain("existing = True");
+	});
+
+	it("applies to files over 2000 lines without truncation", () => {
+		const lines = Array.from({ length: 2500 }, (_, i) => `line_${i + 1}`);
+		lines[2199] = "line_2200";
+		lines[2200] = "old_value";
+		const ops = parse(`*** Begin Patch
+*** Update File: big.py
+@@ marker_at_2200 @@
+ line_2200
+-old_value
++new_value
+*** End Patch`);
+		const fo = new DictFileOps({ "big.py": lines.join("\n") });
+		applyOk(ops, fo);
+		const writtenLines = (fo.files.get("big.py") as string).split("\n");
+		expect(writtenLines.length).toBe(2500);
+		expect(writtenLines.join("\n")).toContain("new_value");
+		expect(writtenLines.join("\n")).not.toContain("old_value");
+	});
+
+	it("preserves lines over 2000 chars verbatim", () => {
+		const longLine = "x".repeat(3000);
+		const ops = parse(`*** Begin Patch
+*** Update File: wide.py
+@@ short_func @@
+ def short_func():
+-    return 1
++    return 2
+*** End Patch`);
+		const fo = new DictFileOps({ "wide.py": `def short_func():\n    return 1\n${longLine}\n` });
+		applyOk(ops, fo);
+		const written = fo.files.get("wide.py") as string;
+		expect(written).toContain(longLine);
+		expect(written).not.toContain("... [truncated]");
+	});
+
+	it("validation failure writes nothing", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: a.py
+ def good():
+-    return 1
++    return 2
+*** Update File: b.py
+ THIS LINE DOES NOT EXIST
+-    old
++    new
+*** End Patch`);
+		const fo = new DictFileOps({
+			"a.py": "def good():\n    return 1\n",
+			"b.py": "completely different content\n",
+		});
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect([...fo.files.entries()]).toEqual([
+			["a.py", "def good():\n    return 1\n"],
+			["b.py", "completely different content\n"],
+		]);
+		expect(result.error).toContain("validation failed");
+		expect(result.error).toContain("  • b.py: hunk 1");
+	});
+
+	it("validation errors identify the hunk number", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: a.py
+@@ first @@
+-first = 1
++first = 2
+@@ missing @@
+-does_not_exist = 1
++does_not_exist = 2
+*** End Patch`);
+		const fo = new DictFileOps({ "a.py": "first = 1\n" });
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect(result.error?.toLowerCase()).toContain("hunk 2");
+	});
+
+	it("Add onto an existing file fails and preserves the original contents", () => {
+		const ops = parse(`*** Begin Patch
+*** Add File: exists.py
++brand new
++content
+*** End Patch`);
+		const fo = new DictFileOps({ "exists.py": "def keep_me():\n    return 1\n" });
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect(fo.files.get("exists.py")).toBe("def keep_me():\n    return 1\n");
+		expect(result.error).toContain("already exists");
+		expect(result.error?.toLowerCase()).toContain("validation failed");
+	});
+
+	it("Delete then Add of the same path still validates (overlay frees the path)", () => {
+		const ops = parse(`*** Begin Patch
+*** Delete File: rewrite.py
+*** Add File: rewrite.py
++fresh = True
+*** End Patch`);
+		const fo = new DictFileOps({ "rewrite.py": "old = True\n" });
+		applyOk(ops, fo);
+		expect(fo.files.get("rewrite.py")).toBe("fresh = True");
+	});
+
+	it("a context-only patch is rejected as containing no changes", () => {
+		const ops = parse(`*** Begin Patch
+*** Update File: f.py
+ keep
+ keep2
+*** End Patch`);
+		const fo = new DictFileOps({ "f.py": "keep\nkeep2\n" });
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect(result.error).toContain("Patch contains no changes (only context lines were provided)");
+	});
+
+	it("delete diff embeds the removed lines, not a placeholder", () => {
+		const ops = parse(`*** Begin Patch
+*** Delete File: old/stuff.py
+*** End Patch`);
+		const fo = new DictFileOps({ "old/stuff.py": "def old_func():\n    return 42\n" });
+		const result = applyOk(ops, fo);
+		expect(result.diff).toBe(
+			"--- a/old/stuff.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-def old_func():\n-    return 42\n",
+		);
+	});
+
+	it("delete of an empty file falls back to the comment diff", () => {
+		const ops = parse(`*** Begin Patch
+*** Delete File: empty.py
+*** End Patch`);
+		const fo = new DictFileOps({ "empty.py": "" });
+		const result = applyOk(ops, fo);
+		// unified_diff produces nothing for two empty inputs — fallback comment expected
+		expect(result.diff).toBe("# Deleted: empty.py");
+	});
+
+	it("two-arg write implementations still work (one call, no double write)", () => {
+		const calls: string[] = [];
+		class BasicOps extends DictFileOps {
+			writeFile(p: string, content: string) {
+				// no preContent parameter — hermes' duck-typed two-arg contract
+				calls.push(p);
+				return super.writeFile(p, content);
+			}
+		}
+		const ops = parse(`*** Begin Patch
+*** Update File: f.py
+@@
+-x = 1
++x = 2
+*** End Patch`);
+		const fo = new BasicOps({ "f.py": "x = 1\n" });
+		applyOk(ops, fo);
+		expect(fo.files.get("f.py")).toBe("x = 2\n");
+		expect(calls).toEqual(["f.py"]); // exactly one write, no double invocation
+	});
+
+	it("a TypeError inside write is surfaced once, never retried with fewer args", () => {
+		const calls: string[] = [];
+		class ExplodingOps extends DictFileOps {
+			writeFile(_p: string, _content: string, _preContent?: string): { error: string | null } {
+				calls.push(_p);
+				throw new TypeError("bug inside a pre_content-capable impl");
+			}
+		}
+		const ops = parse(`*** Begin Patch
+*** Update File: f.py
+@@
+-x = 1
++x = 2
+*** End Patch`);
+		const fo = new ExplodingOps({ "f.py": "x = 1\n" });
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect(result.error).toContain("bug inside");
+		expect(calls).toEqual(["f.py"]); // not silently retried with 2 args
+	});
+
+	it("move-then-update of the same file validates and applies", () => {
+		const ops = parse(`*** Begin Patch
+*** Move File: a.py -> b.py
+*** Update File: b.py
+@@
+-x = 1
++x = 42
+*** End Patch\n`);
+		const fo = new DictFileOps({ "a.py": "x = 1\nkeep = 2\n" });
+		applyOk(ops, fo);
+		expect(fo.files.has("a.py")).toBe(false);
+		expect(fo.files.get("b.py")).toBe("x = 42\nkeep = 2\n");
+	});
+
+	it("the overlay does not mask a genuine move-destination conflict", () => {
+		const ops = parse(`*** Begin Patch
+*** Move File: a.py -> b.py
+*** End Patch\n`);
+		const fo = new DictFileOps({ "a.py": "1\n", "b.py": "2\n" });
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect(result.error).toContain("already exists");
+	});
+
+	it("a CRLF patch body does not inject stray carriage returns", () => {
+		const ops = parse(
+			"*** Begin Patch\r\n*** Update File: f.py\r\n@@\r\n-    x = 1\r\n+    x = 2\r\n*** End Patch\r\n",
+		);
+		const fo = new DictFileOps({ "f.py": "def f():\n    x = 1\n    return x\n" });
+		applyOk(ops, fo);
+		expect(fo.files.get("f.py")).toBe("def f():\n    x = 2\n    return x\n");
+	});
+
+	it("reports apply-phase failures as possibly inconsistent state", () => {
+		// The fake's write always fails: validation passed, apply must report the
+		// race note, not the validation one.
+		const ops = parse(`*** Begin Patch
+*** Update File: f.py
+@@
+-x = 1
++x = 2
+*** End Patch`);
+		const fo = new DictFileOps({ "f.py": "x = 1\n" });
+		fo.writeFile = () => ({ error: "disk on fire" });
+		const result = applyV4AOperations(ops, fo);
+		expect(result.success).toBe(false);
+		expect(result.error).toContain("Apply phase failed (state may be inconsistent — run `git diff` to assess)");
+		expect(result.error).toContain("Failed to update f.py: disk on fire");
+	});
+});
+
+describe("V4A apply: unified diff is Python difflib.unified_diff (CPython goldens)", () => {
+	// Goldens generated with: python3 -c "import difflib; print(repr(''.join(
+	//   difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
+	//   fromfile='a/f.py', tofile='b/f.py'))))" — hunk grouping (get_grouped_opcodes),
+	// range formatting (_format_range_unified) and trailing-newline handling included.
+
+	function updateDiff(fo: DictFileOps, patch: string): PatchResult {
+		return applyOk(parse(patch), fo);
+	}
+
+	it("splits hunks on equal runs longer than 2n", () => {
+		const old = Array.from({ length: 20 }, (_, i) => `l${i}`).join("\n") + "\n";
+		const fo = new DictFileOps({ "f.py": old });
+		const result = updateDiff(fo, `*** Begin Patch
+*** Update File: f.py
+@@ l2 @@
+-l2
++L2
+@@ l15 @@
+-l15
++L15
+*** End Patch`);
+		expect(result.diff).toBe(
+			"--- a/f.py\n+++ b/f.py\n@@ -1,6 +1,6 @@\n l0\n l1\n-l2\n+L2\n l3\n l4\n l5\n"
+			+ "@@ -13,7 +13,7 @@\n l12\n l13\n l14\n-l15\n+L15\n l16\n l17\n l18\n",
+		);
+	});
+
+	it("formats single-line ranges without a length and handles no-trailing-newline files", () => {
+		const fo = new DictFileOps({ "f.py": "x\n" });
+		expect(updateDiff(fo, `*** Begin Patch
+*** Update File: f.py
+-x
++y
+*** End Patch`).diff).toBe("--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-x\n+y\n");
+
+		const fo2 = new DictFileOps({ "f.py": "a\nb" });
+		expect(updateDiff(fo2, `*** Begin Patch
+*** Update File: f.py
+-b
++B
+*** End Patch`).diff).toBe("--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n a\n-b+B");
+	});
+
+	it("trims context to n=3 at file boundaries (CPython grouping)", () => {
+		const old7 = "a\n" + Array.from({ length: 7 }, (_, i) => `e${i}`).join("\n") + "\nz\n";
+		const fo = new DictFileOps({ "f.py": old7 });
+		expect(updateDiff(fo, `*** Begin Patch
+*** Update File: f.py
+@@ top @@
+-a
++A
+@@ bottom @@
+-z
++Z
+*** End Patch`).diff).toBe(
+			"--- a/f.py\n+++ b/f.py\n@@ -1,4 +1,4 @@\n-a\n+A\n e0\n e1\n e2\n@@ -6,4 +6,4 @@\n e4\n e5\n e6\n-z\n+Z\n",
+		);
+
+		// 8 equal lines between the changes: the second group starts one line
+		// later than the 7-line case (CPython's exact shapes, regenerated
+		// directly from difflib to avoid hand-copied goldens).
+		const old8 = "a\n" + Array.from({ length: 8 }, (_, i) => `e${i}`).join("\n") + "\nz\n";
+		const fo2 = new DictFileOps({ "f.py": old8 });
+		expect(updateDiff(fo2, `*** Begin Patch
+*** Update File: f.py
+@@ top @@
+-a
++A
+@@ bottom @@
+-z
++Z
+*** End Patch`).diff).toBe(
+			"--- a/f.py\n+++ b/f.py\n@@ -1,4 +1,4 @@\n-a\n+A\n e0\n e1\n e2\n@@ -7,4 +7,4 @@\n e5\n e6\n e7\n-z\n+Z\n",
+		);
+	});
+
+	it("insertions format the new-side range CPython-style", () => {
+		const fo = new DictFileOps({ "f.py": "a\nc\n" });
+		expect(updateDiff(fo, `*** Begin Patch
+*** Update File: f.py
+@@ a @@
+ a
++B
+*** End Patch`).diff).toBe("--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,3 @@\n a\n+B\n c\n");
+	});
+});
+
+describe("V4A apply: LSP diagnostics propagation (hermes corpora)", () => {
+	const diagBlock = '<diagnostics file="foo.ts">\nERROR [1:7] some diagnostic\n</diagnostics>';
+
+	function opsAdding(path: string, content: string) {
+		const lines = content.split("\n").map((l) => `+${l}`).join("\n");
+		return parse(`*** Begin Patch\n*** Add File: ${path}\n${lines}\n*** End Patch`);
+	}
+
+	it("ADD op: WriteResult.lsp_diagnostics flows through", () => {
+		const fo = new DictFileOps();
+		fo.writeFile = () => ({ error: null, lspDiagnostics: diagBlock });
+		const result = applyOk(opsAdding("foo.ts", "const x: number = 1"), fo);
+		expect(result.lspDiagnostics).toBe(diagBlock);
+	});
+
+	it("UPDATE op: WriteResult.lsp_diagnostics flows through", () => {
+		const ops = parse(`*** Begin Patch\n*** Update File: bar.ts\n-old\n+new\n*** End Patch`);
+		const block = '<diagnostics file="bar.ts">\nERROR [3:1] something\n</diagnostics>';
+		const fo = new DictFileOps({ "bar.ts": "ctx\nold\nctx\n" });
+		fo.writeFile = () => ({ error: null, lspDiagnostics: block });
+		const result = applyOk(ops, fo);
+		expect(result.lspDiagnostics).toBe(block);
+	});
+
+	it("stays null when no write produced diagnostics", () => {
+		const fo = new DictFileOps();
+		fo.writeFile = () => ({ error: null }); // lsp_diagnostics omitted entirely
+		const result = applyOk(opsAdding("foo.py", "x = 1"), fo);
+		expect(result.lspDiagnostics).toBeNull();
+	});
+
+	it("combines per-file blocks so attribution is preserved", () => {
+		const perFile: Record<string, string> = {
+			"a.ts": '<diagnostics file="a.ts">\nERR a\n</diagnostics>',
+			"b.ts": '<diagnostics file="b.ts">\nERR b\n</diagnostics>',
+		};
+		const fo = new DictFileOps();
+		fo.writeFile = (p) => ({ error: null, lspDiagnostics: perFile[p] });
+		const ops = parse(`*** Begin Patch\n*** Add File: a.ts\n+const a = 1\n*** Add File: b.ts\n+const b = 2\n*** End Patch`);
+		const result = applyOk(ops, fo);
+		expect(result.lspDiagnostics).not.toBeNull();
+		expect(result.lspDiagnostics).toContain(perFile["a.ts"]);
+		expect(result.lspDiagnostics).toContain(perFile["b.ts"]);
+	});
+});
+
+describe("V4A apply: validate/apply race defenses", () => {
+	it("retries a failed hunk inside the ±500/+2000 context-hint window", () => {
+		// The file changed between validation and apply (the race the retry
+		// exists for): the pattern is now ambiguous in the full content but
+		// unique within 500 chars before the hint.
+		const drifted = "s".repeat(600) + "alpha\nbeta\n" + "t".repeat(600) + "\nmid\n" + "alpha\nbeta\n" + "end\n";
+		let reads = 0;
+		const writes: string[] = [];
+		const fileOps: V4AFileOps = {
+			readFileRaw: () => {
+				reads++;
+				return reads === 1 ? { content: "alpha\nbeta\nkeep\n", error: null } : { content: drifted, error: null };
+			},
+			writeFile: (_p, content) => {
+				writes.push(content);
+				return { error: null };
+			},
+			deleteFile: () => ({ error: null }),
+			moveFile: () => ({ error: null }),
+		};
+		const result = applyV4APatch(`*** Begin Patch
+*** Update File: f.py
+@@ mid @@
+-alpha
+-beta
++alpha
++gamma
+*** End Patch`, fileOps);
+		expect(result.success).toBe(true);
+		expect(writes.length).toBe(1);
+		// The edit landed at the SECOND occurrence (inside the hint window); the
+		// first occurrence, outside the window, is untouched.
+		const firstNeedleEnd = drifted.indexOf("beta") + "beta".length;
+		expect(writes[0].indexOf("gamma")).toBeGreaterThan(firstNeedleEnd);
+		expect(writes[0].split("beta").length - 1).toBe(1);
+	});
+
+	it("mirrors validation's already-applied skip when the file moved under the patch", () => {
+		let reads = 0;
+		const writes: string[] = [];
+		const fileOps: V4AFileOps = {
+			readFileRaw: () => {
+				reads++;
+				return reads === 1
+					? { content: "alpha\nbeta\nkeep\n", error: null }
+					: { content: "alpha\ngamma\nkeep\n", error: null };
+			},
+			writeFile: (_p, content) => {
+				writes.push(content);
+				return { error: null };
+			},
+			deleteFile: () => ({ error: null }),
+			moveFile: () => ({ error: null }),
+		};
+		const result = applyV4APatch(`*** Begin Patch
+*** Update File: f.py
+@@
+-alpha
+-beta
++alpha
++gamma
+*** End Patch`, fileOps);
+		// The apply-phase fuzzy fails, the already-applied check matches, and the
+		// hunk is skipped instead of failing the whole patch.
+		expect(result.success).toBe(true);
+		expect(writes.length).toBe(1);
+		expect(writes[0]).toBe("alpha\ngamma\nkeep\n");
+	});
+});
+
+describe("V4A apply: BOM round trip (hermes corpora)", () => {
+	const BOM = "\uFEFF";
+
+	/** Fake file_ops mimicking the real read/write contract the tool layer
+	 * implements (Tier 3 #10): raw reads arrive BOM-stripped, writes probe the
+	 * target on disk and restore a BOM the original had. */
+	function bomPreservingFileOps(file: string, originalBytes: string): V4AFileOps {
+		return {
+			readFileRaw: () => {
+				const decoded = originalBytes;
+				return { content: decoded.startsWith(BOM) ? decoded.slice(1) : decoded, error: null };
+			},
+			writeFile: (_p, content) => {
+				// Simulate the real write: probe the target for a BOM and prepend
+				// if the original had one.
+				const disk = readFileSync(file, "utf-8");
+				const hadBom = disk.startsWith(BOM);
+				const out = hadBom && !content.startsWith(BOM) ? BOM + content : content;
+				writeFileSync(file, out, "utf-8");
+				return { error: null };
+			},
+			deleteFile: () => ({ error: null }),
+			moveFile: () => ({ error: null }),
+		};
+	}
+
+	it("a V4A UPDATE on a BOM-bearing file keeps the BOM", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-v4a-"));
+		const file = path.join(dir, "bom_config.py");
+		const original = BOM + "setting = 'old'\n";
+		await fs.writeFile(file, original, "utf-8");
+		const ops = parse(`*** Begin Patch
+*** Update File: bom_config.py
+@@ setting @@
+-setting = 'old'
++setting = 'new'
+*** End Patch`);
+		const result = applyOk(ops, bomPreservingFileOps(file, original));
+		expect(result.success).toBe(true);
+		const raw = await fs.readFile(file, "utf-8");
+		expect(raw.startsWith(BOM)).toBe(true);
+		expect(raw).toContain("setting = 'new'");
+		expect(raw).not.toContain("setting = 'old'");
+	});
+
+	it("a V4A UPDATE on a plain file must NOT inject a BOM", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-v4a-"));
+		const file = path.join(dir, "plain.py");
+		const original = "print('hello')\n";
+		await fs.writeFile(file, original, "utf-8");
+		const ops = parse(`*** Begin Patch
+*** Update File: plain.py
+@@ print @@
+-print('hello')
++print('world')
+*** End Patch`);
+		const result = applyOk(ops, bomPreservingFileOps(file, original));
+		expect(result.success).toBe(true);
+		const raw = await fs.readFile(file, "utf-8");
+		expect(raw.startsWith(BOM)).toBe(false);
+		expect(raw).toContain("print('world')");
+	});
+});
+
+describe("orchestrator: fuzzyFindAndReplace unification (Tier 3 #8)", () => {
+	it("an identical old/new re-send whose text is present is hermes' success-shaped no-op", () => {
+		// hermes gates identical strings inside fuzzy_find_and_replace, so
+		// _no_match_result's already-applied check sees the error first and the
+		// re-send lands as a no-op — not as the identical-strings teaching error.
+		const r = applyReplacement("value = 42\n", { oldString: "value = 42", newString: "value = 42", replaceAll: false }, "f.py");
+		expect(r).toEqual({
+			ok: false,
+			alreadyApplied: true,
+			errorMessage:
+				"File already contains the target text — the edit appears to be already applied to f.py. " +
+				"No write performed; do not re-send this patch.",
+		});
+	});
+
+	it("short identical strings keep the identical-strings teaching error", () => {
+		const r = applyReplacement("abc\n", { oldString: "abc", newString: "abc", replaceAll: false }, "f.py");
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.alreadyApplied).toBeUndefined();
+			expect(r.errorMessage).toMatch(/^No edit was applied because old_string and new_string are identical/);
+		}
+	});
 });

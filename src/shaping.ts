@@ -220,14 +220,20 @@ interface MatchBlock {
  * must match SequenceMatcher's, not merely approximate it (differential fuzz
  * showed jsdiff's greedy prefix/suffix script produces different — and
  * text-changing — opcodes on adversarial inputs).
+ *
+ * difflib is element-agnostic, and so is this port: pass LISTS to match on
+ * whole elements instead of UTF-16 units — `difflib.unified_diff` feeds it
+ * line lists (the V4A delete/update diffs, `src/v4a.ts`), and autojunk's
+ * popular-element purge then applies per line, exactly as in CPython.
  */
 export class SequenceMatcher {
-	readonly a: string;
-	private b: string;
+	/** The A sequence — UTF-16 units for string input, whole lines for line input. */
+	readonly a: string | readonly string[];
+	private b: string | readonly string[];
 	/** b element -> ascending indices in b (popular elements purged). */
 	private b2j: Map<string, number[]>;
 
-	constructor(a: string, b: string, autojunk = true) {
+	constructor(a: string | readonly string[], b: string | readonly string[], autojunk = true) {
 		this.a = a;
 		this.b = b;
 		// __chain_b: isjunk is None -> only the popular-element purge applies.
@@ -348,5 +354,39 @@ export class SequenceMatcher {
 			if (size > 0) answer.push(["equal", ai, i, bj, j]);
 		}
 		return answer;
+	}
+
+	/** CPython get_grouped_opcodes(n): isolate change clusters by trimming the
+	 * leading/trailing equal runs to n elements and splitting on equal runs
+	 * longer than 2n. This is what difflib.unified_diff iterates (the V4A
+	 * delete/update diffs) — identical output, golden-checked against CPython. */
+	getGroupedOpcodes(n = 3): Opcode[][] {
+		const codes = this.getOpcodes();
+		if (codes.length === 0) codes.push(["equal", 0, 1, 0, 1]);
+		// Fixup leading and trailing groups if they show no changes.
+		const first = codes[0];
+		if (first[0] === "equal") {
+			codes[0] = ["equal", Math.max(first[1], first[2] - n), first[2], Math.max(first[3], first[4] - n), first[4]];
+		}
+		const last = codes[codes.length - 1];
+		if (last[0] === "equal") {
+			codes[codes.length - 1] = ["equal", last[1], Math.min(last[2], last[1] + n), last[3], Math.min(last[4], last[3] + n)];
+		}
+		const nn = n + n;
+		const groups: Opcode[][] = [];
+		let group: Opcode[] = [];
+		for (const [tag, i1, i2, j1, j2] of codes) {
+			// End the current group and start a new one whenever there is a
+			// large range with no changes.
+			if (tag === "equal" && i2 - i1 > nn) {
+				group.push(["equal", i1, Math.min(i2, i1 + n), j1, Math.min(j2, j1 + n)]);
+				groups.push(group);
+				group = [["equal", Math.max(i1, i2 - n), i2, Math.max(j1, j2 - n), j2]];
+			} else {
+				group.push([tag, i1, i2, j1, j2]);
+			}
+		}
+		if (group.length > 0 && !(group.length === 1 && group[0][0] === "equal")) groups.push(group);
+		return groups;
 	}
 }

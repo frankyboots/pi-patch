@@ -72,10 +72,10 @@ export function replaceAllRefusalMessage(count: number, strategy: string): strin
 	);
 }
 
-/** Python repr for the sequences quoted in drift messages (hermes embeds
- * `{suspect!r}`): backslashes double, and the delimiter is picked so the
- * quote character itself needs no escaping. */
-function pyRepr(s: string): string {
+/** Python repr for the sequences quoted in error texts (hermes embeds
+ * `{x!r}` — drift suspects, V4A parse paths): backslashes double, and the
+ * delimiter is picked so the quote character itself needs no escaping. */
+export function pyRepr(s: string): string {
 	let quote = "'";
 	let body = s.replaceAll("\\", "\\\\");
 	if (s.includes("'") && !s.includes('"')) {

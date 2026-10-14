@@ -115,6 +115,43 @@ Implemented so far:
       snippet. Hints ride inside the message text (ledger #6). The TUI preview
       deliberately never touches the tracker — only execute() counts.
 
+- [x] Tier 3 #8: `patch_parser.py` ported verbatim (`src/v4a.ts`). `parseV4APatch`
+      (markers column-0-anchored so content that merely mentions the format can't
+      truncate a patch; CRLF-tolerant; empty-path / UPDATE-without-hunks /
+      MOVE-destination parse errors accumulate into one `Parse error: …`), then the
+      two-phase apply (`applyV4AOperations`): validate EVERYTHING first against a
+      simulation overlay (Move-then-Update, Delete-then-Add, Add-after-Delete), and
+      only then write — a validation failure modifies nothing, an apply-phase
+      failure carries the "run `git diff`" note. Update hunks go through the shared
+      `fuzzyFindAndReplace` — hermes' `fuzzy_find_and_replace` orchestrator entry,
+      now in `chain.ts` so BOTH surfaces call it (replace mode's
+      `applyReplacement` delegates to it too) — with the ±500/+2000 context-hint
+      window retry for validate/apply races, addition-only hint insertion
+      (`_insert_addition_only`), and the already-applied skip mirroring
+      validation's on both phases. Delete/Move emit real `difflib.unified_diff`
+      output: `get_grouped_opcodes` + `_format_range_unified` ported onto the (now
+      element-agnostic) `SequenceMatcher`, golden-checked against CPython
+      (hunk grouping, range formatting, trailing-newline handling); differential
+      fuzz re-run after the generalization (2 seeds × 500, char- and line-level
+      opcodes + grouped opcodes) — clean modulo the documented UTF-16-unit basis
+      (astral char-level cases skipped; line elements are code-point-agnostic).
+      The `test_patch_parser.py` corpus is ported (parse ops, boundary markers,
+      validation atomicity, Add-onto-existing guard, delete diffs incl. the
+      `# Deleted:` fallback, duck-typed two-arg write compat + the
+      one-call/no-silent-retry contracts, move-then-update, CRLF bodies, BOM
+      round trip, LSP diagnostics propagation) plus race-defense tests for the
+      window retry and the already-applied mirror. Two faithful adaptations:
+      hermes' `inspect.signature` probe for `write_file`'s `pre_content`
+      capability became an interface contract (`V4AFileOps.writeFile` always
+      receives it — extra args are inert for implementations that ignore them,
+      so the single-write/no-retry contracts hold by construction), and moving
+      the identical-strings gate inside `fuzzy_find_and_replace` FIXED a latent
+      replace-mode deviation: an identical old/new re-send whose text is already
+      present (≥ 8 non-blank chars) now returns hermes' success-shaped no-op
+      (hermes `_no_match_result` ordering) instead of the teaching error. The
+      tool handler still answers "not available in this build" until #9/#10 wire
+      it (ledger #15).
+
 ## Build plan (exact-port tiers)
 
 Tiers are ordered by dependency, not by value: the strategy chain (Tier 1) is the matching
@@ -160,9 +197,12 @@ though V4A is now in scope.
 
 ### Tier 3 — V4A patch mode
 
-- [ ] 8. Port `patch_parser.py` verbatim: parse → validate → apply; Update hunks through the
+- [x] 8. Port `patch_parser.py` verbatim: parse → validate → apply; Update hunks through the
       shared chain with the context-hint window retry (−500/+2000 chars); addition-only hint
-      insertion; already-applied skip mirroring validation's.
+      insertion; already-applied skip mirroring validation's. (`src/v4a.ts`; the shared
+      `fuzzy_find_and_replace` entry lives in `chain.ts` and both surfaces call it;
+      `get_grouped_opcodes`/`_format_range_unified` on `shaping.ts`'s SequenceMatcher,
+      now element-agnostic. Handler wiring is #9/#10.)
 - [ ] 9. Schema layering: base schema replace-only; `mode`+`patch` params and the dual-mode
       description layered only when the OpenAI-family gate passes (`PI_PROVIDER`/`PI_MODEL`,
       fail-closed); handler accepts both shapes from any model; `mode` defaults to `replace`.
@@ -241,4 +281,4 @@ first.
 | 12 | `replace_all` de-duplicates self-overlapping line-window spans (leftmost-greedy, str.replace semantics) instead of splicing them | deliberate improvement | hermes' window rungs can emit overlapping spans under `replace_all` and its reverse-order splice then corrupts the file (e.g. ` a\na` over `a\na\na` → `R`); hermes itself fixed exactly this for `_strategy_exact` ("aligns with str.replace") — the same non-overlap invariant is enforced for every strategy |
 | 13 | Base description omits hermes' "Auto-runs syntax checks after editing." promise | environment-forced | pi exposes no lint harness (row #5); advertising it would teach the model to wait for diagnostics that never arrive. The rest of hermes' base description is verbatim |
 | 14 | `edits[]` is not a `patch` parameter: a call carrying it (single entry → flattened, several → refused with a teaching error) | deliberate | the transitional multi-edit surface is retired by #5; silently applying the first of several requested replacements would report work that never happened, so the refusal teaches the flat shape and says "do not re-send this call unchanged" |
-| 15 | `mode`/`patch` are accepted from any model but answered with "V4A … is not available in this build" until Tier 3 | deliberate (interim, removed by Tier 3 #8/#9) | hermes would apply the patch; we must not pretend to. The base schema stays replace-only exactly like hermes' unlayered schema, `Unknown mode: X` keeps hermes' text, and the handler-side acceptance is already in place so Tier 3 only adds the parser. Nuance kept hermes-compatible: hermes' mode dispatch is exclusive and defaults to `replace`, so a **stray** `patch` param on a complete replace call is ignored (the edit lands); only `mode="patch"`, or V4A-looking content with no complete replacement in flight, gets the refusal — where hermes answers `patch content required` we answer "not available", since that is the true statement here |
+| 15 | `mode`/`patch` are accepted from any model but answered with "V4A … is not available in this build" until the handler switches over | deliberate (interim; the parser itself is ported — Tier 3 #8, `src/v4a.ts` — the refusal remains until #9/#10 wire it in) | hermes would apply the patch; we must not pretend to. The base schema stays replace-only exactly like hermes' unlayered schema, `Unknown mode: X` keeps hermes' text, and the handler-side acceptance is already in place so #9 only adds schema layering + the dispatch. Nuance kept hermes-compatible: hermes' mode dispatch is exclusive and defaults to `replace`, so a **stray** `patch` param on a complete replace call is ignored (the edit lands); only `mode="patch"`, or V4A-looking content with no complete replacement in flight, gets the refusal — where hermes answers `patch content required` we answer "not available", since that is the true statement here |

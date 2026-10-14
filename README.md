@@ -85,10 +85,12 @@ through `context_aware`, in hermes' order), the escape-drift guards, replacement
 (reindent, unicode-preserving opcodes, conditional `\t`/`\r` unescape), hermes' `replace_all`,
 hermes' flat surface with hermes' argument gates (Tier 2 #5), teaching errors byte-exact to
 Appendix B modulo pi tool names, the already-applied no-op, the model-facing unified diff +
-own preview renderer, and argument normalization. Remaining: the failure counter + escalation
-(Tier 2 #6), the V4A `mode:"patch"` port (Tier 3 — the handler already *accepts* `mode`/`patch`
-and refuses with "not available in this build" until then, ledger #15), and operational parity
-— post-write verification, staleness tracking, strategy telemetry (Tier 4).
+own preview renderer, argument normalization, the failure counter + escalation (Tier 2 #6),
+and the V4A parser/applier (`src/v4a.ts`, Tier 3 #8 — parse → validate → apply, Update hunks
+through the shared chain). Remaining: the V4A handler wiring (schema layering + plumbing,
+Tier 3 #9/#10 — the handler already *accepts* `mode`/`patch` and refuses with "not available
+in this build" until then, ledger #15), and operational parity — post-write verification,
+staleness tracking, strategy telemetry (Tier 4).
 
 ## Development
 

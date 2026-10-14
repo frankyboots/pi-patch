@@ -78,6 +78,10 @@ src/shaping.ts   replacement shaping — conditional \t/\r unescape, unicode-pre
                  (ports of hermes' orchestrator-tail shaping helpers)
 src/errors.ts    teaching error builders (did-you-mean, whitespace viz, recovery text)
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
+src/v4a.ts       V4A patch parser/applier — port of hermes `patch_parser.py` (parse →
+                 validate → apply, Tier 3 #8); duck-typed `V4AFileOps` so tests run
+                 in-memory and the tool layer (Tier 3 #10) supplies the real
+                 mutation-queued implementation
 src/render.ts    TUI call/result renderers with live preview (uses OUR engine)
 src/text.ts      LF/BOM/CRLF helpers, line index
 src/span-map.ts  span-mapping helpers ported verbatim from hermes `fuzzy_match.py`
@@ -117,11 +121,13 @@ hermes or add a row to PLAN.md's deviations ledger.
   (`replace_all` landed as Tier 1 #2 with hermes' semantics: every match of the winning
   strategy splices, similarity strategies refuse it; see ledger #12 for the self-overlap
   guard hermes lacks.)
-- **V4A patch mode is in scope, not optional**: `patch` must grow `mode:"patch"` with
-  hermes' schema layering (advertised to OpenAI-family models only, fail-closed; accepted
-  from any model) — analysis §2.1, PLAN.md Tier 3. The handler already *accepts* `mode`/
-  `patch` and answers with "not available in this build" (ledger #15); Tier 3 replaces that
-  answer with the parser, not with new acceptance code.
+- **V4A patch mode is in scope, not optional**: `patch` grows `mode:"patch"` with hermes'
+  schema layering (advertised to OpenAI-family models only, fail-closed; accepted from any
+  model) — analysis §2.1, PLAN.md Tier 3. The parser/applier is ported (`src/v4a.ts`,
+  Tier 3 #8 — Update hunks ride the shared chain via `fuzzyFindAndReplace`, application is
+  two-phase validate-then-write); the handler still answers "not available in this build"
+  (ledger #15) until Tier 3 #9/#10 add the schema layering and tool-layer plumbing. That
+  switch replaces the refusal with the parser, not with new acceptance code.
 - **Already-applied no-op is success-shaped** ("do not re-send this patch"), with a
   conservative guard: `new_string` ≥ 8 non-blank chars present exactly and `old_string` gone.
   Keep it conservative — it must never mask a real partial application.
