@@ -27,11 +27,18 @@ reschema):
 - [x] Own preview renderer (computes the preview with **our** engine, not core's `computeEditsDiff`)
 - [x] Reindent replacement shaping
 - [x] Argument normalization
-- [x] Tier 1 #1 (in progress): span-mapping helpers ported verbatim from
-      `fuzzy_match.py` (`src/span-map.ts`), differentially tested against the
-      reference implementation via a generated golden corpus
-      (`scripts/generate_span_map_golden.py` → `test/golden/span-map.json`);
-      the 5 new strategies themselves are not wired into the chain yet
+- [x] Tier 1 #1: chain complete — all 9 strategies wired in hermes' order
+      (`src/chain.ts`; span-mapping helpers ported verbatim in `src/span-map.ts`,
+      differentially tested via the generated golden corpus
+      `scripts/generate_span_map_golden.py` → `test/golden/span-map.json`).
+      The applicable `test_fuzzy_match.py` cases are ported to
+      `test/patch.test.ts` and their chain-level outputs (strategy, count,
+      spliced result) differentially validated against the real
+      `fuzzy_find_and_replace`; the remaining corpus cases are owned by the
+      steps that provide what they exercise — #2 (`replace_all`), #3
+      (escape-drift guards), #4 (unicode-preserving replacement,
+      `\t`/`\r` unescape). Similarity ratios use the `diff`-package opcode
+      stand-in for `SequenceMatcher` (PLAN.md complexity table).
 
 ## Build plan (exact-port tiers)
 
@@ -41,7 +48,7 @@ though V4A is now in scope.
 
 ### Tier 1 — replace-mode matching core (the load-bearing port)
 
-- [ ] 1. Complete the chain to hermes' 9 strategies: add `whitespace_normalized`,
+- [x] 1. Complete the chain to hermes' 9 strategies: add `whitespace_normalized`,
       `escape_normalized`, `unicode_normalized`, `block_anchor`, `context_aware`, with the
       span-mapping helpers ported verbatim from `fuzzy_match.py` (reference order:
       Appendix A). Uniqueness stays per-strategy, counted in that strategy's space (§3.1).
@@ -134,7 +141,7 @@ first.
 | # | Deviation | Kind | Rationale |
 |---|---|---|---|
 | 1 | Tool registered as `patch` alongside the built-in `edit` (not replacing it) | deliberate | this project's reason to exist: A/B the two engines in one session; hermes has no built-in twin to preserve |
-| 2 | LF pre-normalization before matching; hermes matches raw bytes (CRLF included) | deliberate improvement | models emit bare-LF anchors; hermes loses strategies 1/3/4/6 on CRLF files; we match everywhere and restore endings on write (§3.3) |
+| 2 | LF pre-normalization before matching; hermes matches raw bytes (CRLF included) | deliberate improvement | models emit bare-LF anchors; hermes loses strategies 1/3/4/6 on CRLF files; we match everywhere and restore endings on write (§3.3). Consequence: a literal-`\r` anchor (strategy 5) loses its target byte after normalization and on CRLF files falls through to the similarity rungs instead |
 | 3 | `withFileMutationQueue` instead of hermes' `FileStateRegistry` locks | environment-forced | pi's public plumbing; same per-path serialization guarantee |
 | 4 | No `task_id`/`cross_profile` and none of `_write_precheck_error`'s gates (sensitive-path denylist, binary-document guard, protected-instruction guard, approval gate, mirror guard) | environment-forced | pi handles approval and workspace policy outside tools; there is no task registry to key state on. Revisit only if pi grows an equivalent policy layer |
 | 5 | No lint/LSP diagnostics in the result | environment-forced (today) | pi has no public lint/LSP harness; Tier 4 #14 tracks it |

@@ -1,15 +1,15 @@
 /**
- * Ordered match-strategy chain for `patch` — following hermes' reference
- * order (docs/EDIT-TOOL-ANALYSIS.md Appendix A):
+ * Ordered match-strategy chain for `patch` — a verbatim port of hermes'
+ * fuzzy_match.py STRATEGIES (docs/EDIT-TOOL-ANALYSIS.md Appendix A):
  *
  *   exact → line_trimmed → whitespace_normalized → indentation_flexible
  *         → escape_normalized → trimmed_boundary → unicode_normalized
  *         → block_anchor → context_aware
  *
- * The first four are implemented (the ones needing no span algebra); Tier 1
- * of the exact-port plan (docs/PLAN.md) adds the missing five in exactly
- * this order.
- * Ported from hermes' fuzzy_match.py. Key properties copied verbatim:
+ * Each strategy is a standalone `(content, pattern) => Span[]` function, as in
+ * hermes. Spans are returned into the content the splice runs on (here the
+ * LF-normalized file text — deviations ledger #2; hermes matches raw bytes).
+ * Key properties copied verbatim:
  *
  * - First strategy with ≥1 match wins; >1 match → ambiguous error with the
  *   match locations. No fall-through past an ambiguous result.
@@ -17,19 +17,39 @@
  *   avoids pi's normalize-then-count false-ambiguity bug (§3.1 of the
  *   analysis): two regions differing only by smart quotes cannot make a
  *   byte-unique oldText report "Found 2 occurrences".
- * - Strategies return spans into the (LF-normalized) original content, so the
- *   matched file bytes — not the pattern's — drive the splice.
+ * - Line-window strategies go through `matchTransformedLines`; character-level
+ *   strategies (whitespace/unicode normalized) match in normalized space and
+ *   map spans back with the span-map algebra, so the matched file bytes — not
+ *   the pattern's — drive the replacement.
+ *
+ * `runChain` is the single-replacement orchestrator path (hermes'
+ * `fuzzy_find_and_replace` minus `replace_all` and the escape-drift guards,
+ * which land with Tier 1 #2/#3 in docs/PLAN.md).
  */
-import { buildLineIndex, countOccurrences, lineAt, type LineIndex } from "./text.js";
+import { buildLineIndex, lineAt, similarity, type LineIndex } from "./text.js";
+import {
+	buildOrigToNormMap,
+	collapseWhitespace,
+	exactSpans,
+	mapNormalizedPositions,
+	mapPositionsNormToOrig,
+	matchTransformedLines,
+	stripBoundary,
+	unicodeNormalize,
+	windowSpans,
+	type Span,
+} from "./span-map.js";
 
-export type StrategyName = "exact" | "line_trimmed" | "indentation_flexible" | "trimmed_boundary";
-
-export const STRATEGY_CHAIN: readonly StrategyName[] = [
-	"exact",
-	"line_trimmed",
-	"indentation_flexible",
-	"trimmed_boundary",
-];
+export type StrategyName =
+	| "exact"
+	| "line_trimmed"
+	| "whitespace_normalized"
+	| "indentation_flexible"
+	| "escape_normalized"
+	| "trimmed_boundary"
+	| "unicode_normalized"
+	| "block_anchor"
+	| "context_aware";
 
 export interface ChainMatch {
 	strategy: StrategyName;
@@ -54,82 +74,153 @@ export type ChainFailure =
 
 export type ChainResult = { ok: true; match: ChainMatch } | { ok: false; failure: ChainFailure };
 
-interface PatternLines {
-	lines: string[];
-	requiresTrailingNewline: boolean;
+// ── Strategies ───────────────────────────────────────────────────────────
+// Each takes (content, pattern) and returns spans in the ORIGINAL
+// (LF-normalized) content.
+
+/** Strategy 1: exact, non-overlapping occurrences (str.replace semantics —
+ * overlapping spans would corrupt the file under replace_all). */
+export function strategyExact(content: string, pattern: string): Span[] {
+	return exactSpans(content, pattern);
 }
 
-function parsePattern(oldText: string): PatternLines {
-	if (oldText.endsWith("\n")) {
-		return { lines: oldText.slice(0, -1).split("\n"), requiresTrailingNewline: true };
+/** Strategy 2: strip each line before comparing. */
+export function strategyLineTrimmed(content: string, pattern: string): Span[] {
+	return matchTransformedLines(content, pattern, (ls) => ls.map((l) => l.trim()));
+}
+
+/** Strategy 3: collapse runs of spaces/tabs to a single space. */
+export function strategyWhitespaceNormalized(content: string, pattern: string): Span[] {
+	const contentNormalized = collapseWhitespace(content);
+	const matchesInNormalized = exactSpans(contentNormalized, collapseWhitespace(pattern));
+	if (matchesInNormalized.length === 0) return [];
+	return mapNormalizedPositions(content, contentNormalized, matchesInNormalized);
+}
+
+/** Strategy 4: ignore leading indentation entirely. */
+export function strategyIndentationFlexible(content: string, pattern: string): Span[] {
+	return matchTransformedLines(content, pattern, (ls) => ls.map((l) => l.replace(/^\s+/, "")));
+}
+
+/** Strategy 5: treat literal `\n`/`\t`/`\r` in the pattern as control chars. */
+export function strategyEscapeNormalized(content: string, pattern: string): Span[] {
+	const patternUnescaped = pattern
+		.replaceAll("\\n", "\n")
+		.replaceAll("\\t", "\t")
+		.replaceAll("\\r", "\r");
+	if (patternUnescaped === pattern) return [];
+	return exactSpans(content, patternUnescaped);
+}
+
+/** Strategy 6: strip whitespace on the first and last lines only. */
+export function strategyTrimmedBoundary(content: string, pattern: string): Span[] {
+	return matchTransformedLines(content, pattern, stripBoundary);
+}
+
+/** Strategy 7: exact/line-trimmed match after Unicode->ASCII normalisation of both sides. */
+export function strategyUnicodeNormalized(content: string, pattern: string): Span[] {
+	const normPattern = unicodeNormalize(pattern);
+	const normContent = unicodeNormalize(content);
+	if (normContent === content && normPattern === pattern) return [];
+	let normMatches = exactSpans(normContent, normPattern);
+	if (normMatches.length === 0) {
+		normMatches = matchTransformedLines(normContent, normPattern, (ls) => ls.map((l) => l.trim()));
 	}
-	return { lines: oldText.split("\n"), requiresTrailingNewline: false };
+	if (normMatches.length === 0) return [];
+	return mapPositionsNormToOrig(buildOrigToNormMap(content), normMatches);
 }
 
-type LineComparator = (patternLine: string, contentLine: string, k: number, n: number) => boolean;
+/** Strategy 8: anchor on first+last lines, similarity-score the middle. */
+export function strategyBlockAnchor(content: string, pattern: string): Span[] {
+	const patternLines = unicodeNormalize(pattern).split("\n");
+	if (patternLines.length < 2) return [];
+	const firstLine = patternLines[0].trim();
+	const lastLine = patternLines[patternLines.length - 1].trim();
+	const n = patternLines.length;
 
-function comparatorFor(strategy: StrategyName): LineComparator {
-	switch (strategy) {
-		case "line_trimmed":
-			// Margin whitespace churn: leading and trailing whitespace ignored per line.
-			return (p, c) => p.trim() === c.trim();
-		case "indentation_flexible":
-			// The classic small-model error: dropped/shifted indentation.
-			return (p, c) => p.replace(/^\s+/, "") === c.replace(/^\s+/, "");
-		case "trimmed_boundary":
-			// Decorative whitespace on the anchor lines only; interior lines exact.
-			return (p, c, k, n) => (k === 0 || k === n - 1 ? p.trim() === c.trim() : p === c);
-		case "exact":
-			return (p, c) => p === c;
+	// Match on normalized lines; compute offsets from the ORIGINAL lines so
+	// multi-char expansions (em-dash -> '--') don't shift positions.
+	const normContentLines = unicodeNormalize(content).split("\n");
+	const potentialMatches = new Set<number>();
+	for (let i = 0; i + n <= normContentLines.length; i++) {
+		if (normContentLines[i].trim() === firstLine && normContentLines[i + n - 1].trim() === lastLine) {
+			potentialMatches.add(i);
+		}
 	}
+	// Looser thresholds (0.10/0.30) matched unrelated blocks; these are the safe floor.
+	const threshold = potentialMatches.size === 1 ? 0.5 : 0.7;
+	const patternMiddle = patternLines.slice(1, -1).join("\n");
+
+	const similar = (i: number): boolean => {
+		if (!potentialMatches.has(i)) return false;
+		if (n <= 2) return true;
+		const contentMiddle = normContentLines.slice(i + 1, i + n - 1).join("\n");
+		return similarity(contentMiddle, patternMiddle) >= threshold;
+	};
+
+	return windowSpans(content, content.split("\n"), n, similar);
 }
 
-function findLineMatches(
-	index: LineIndex,
-	pattern: PatternLines,
-	compare: LineComparator,
-): { start: number; end: number }[] {
-	const n = pattern.lines.length;
-	const coreCount = index.endsWithNewline ? index.lines.length - 1 : index.lines.length;
-	const matches: { start: number; end: number }[] = [];
-	if (n === 0) return matches;
-	for (let i = 0; i + n <= coreCount; i++) {
-		let ok = true;
+/** Strategy 9 (last resort): anchored per-line similarity, every non-blank line >= 0.80.
+ * The anchor pre-filter bounds the scan; the all-lines rule stops coincidental matches. */
+export function strategyContextAware(content: string, pattern: string): Span[] {
+	const patternLines = pattern.split("\n");
+	const contentLines = content.split("\n");
+	const n = patternLines.length;
+	if (n > contentLines.length) return [];
+	const firstPat = patternLines[0].trim();
+	const lastPat = patternLines[n - 1].trim();
+
+	const sim = (a: string, b: string): number => (a === b ? 1 : similarity(a, b));
+
+	const accept = (i: number): boolean => {
+		const blockLines = contentLines.slice(i, i + n);
+		if (sim(firstPat, blockLines[0].trim()) < 0.8) return false;
+		if (sim(lastPat, blockLines[blockLines.length - 1].trim()) < 0.8) return false;
 		for (let k = 0; k < n; k++) {
-			if (!compare(pattern.lines[k], index.lines[i + k], k, n)) {
-				ok = false;
-				break;
-			}
+			const pLine = patternLines[k].trim();
+			if (pLine.length === 0) continue;
+			if (sim(pLine, blockLines[k].trim()) < 0.8) return false;
 		}
-		if (!ok) continue;
-		if (pattern.requiresTrailingNewline) {
-			const last = i + n - 1;
-			// Pattern demands a newline after the last line; a window that ends at
-			// a final line without trailing newline cannot satisfy it.
-			if (last === coreCount - 1 && !index.endsWithNewline) continue;
-			matches.push({ start: index.starts[i], end: index.starts[last + 1] });
-		} else {
-			matches.push({ start: index.starts[i], end: index.lineEnd(i + n - 1) });
-		}
-	}
-	return matches;
+		return true;
+	};
+
+	return windowSpans(content, contentLines, n, accept);
 }
+
+/** Matches from these only *approximately* resemble oldText — fine for one
+ * unique replacement, never safe under replace_all (Tier 1 #2). */
+export const SIMILARITY_STRATEGIES: ReadonlySet<StrategyName> = new Set([
+	"block_anchor",
+	"context_aware",
+]);
+
+/** Ordered chain: precise strategies first, similarity-based last. */
+export const STRATEGIES: readonly {
+	name: StrategyName;
+	fn: (content: string, pattern: string) => Span[];
+}[] = [
+	{ name: "exact", fn: strategyExact },
+	{ name: "line_trimmed", fn: strategyLineTrimmed },
+	{ name: "whitespace_normalized", fn: strategyWhitespaceNormalized },
+	{ name: "indentation_flexible", fn: strategyIndentationFlexible },
+	{ name: "escape_normalized", fn: strategyEscapeNormalized },
+	{ name: "trimmed_boundary", fn: strategyTrimmedBoundary },
+	{ name: "unicode_normalized", fn: strategyUnicodeNormalized },
+	{ name: "block_anchor", fn: strategyBlockAnchor },
+	{ name: "context_aware", fn: strategyContextAware },
+];
+
+// ── Orchestrator (single-replacement path) ───────────────────────────────
+
+const MAX_LOCATIONS = 5;
 
 function locationAt(index: LineIndex, content: string, offset: number): MatchLocation {
 	const line = lineAt(index, offset);
 	const text = index.lines[line - 1] ?? "";
-	const snippet = text.trim().length > 80 ? `${text.trim().slice(0, 79)}…` : text.trim();
+	let snippet = text.trim();
+	if (snippet.length > 80) snippet = `${snippet.slice(0, 77)}...`;
 	return { line, snippet };
-}
-
-function exactLocations(index: LineIndex, content: string, needle: string, max: number): MatchLocation[] {
-	const locations: MatchLocation[] = [];
-	let idx = content.indexOf(needle);
-	while (idx !== -1 && locations.length < max) {
-		locations.push(locationAt(index, content, idx));
-		idx = content.indexOf(needle, idx + 1);
-	}
-	return locations;
 }
 
 /**
@@ -139,46 +230,24 @@ function exactLocations(index: LineIndex, content: string, needle: string, max: 
  */
 export function runChain(content: string, oldText: string): ChainResult {
 	const index = buildLineIndex(content);
-	const pattern = parsePattern(oldText);
-
-	for (const strategy of STRATEGY_CHAIN) {
-		if (strategy === "exact") {
-			const count = countOccurrences(content, oldText);
-			if (count === 1) {
-				const start = content.indexOf(oldText);
-				return { ok: true, match: { strategy, start, end: start + oldText.length, exact: true } };
-			}
-			if (count > 1) {
-				return {
-					ok: false,
-					failure: {
-						kind: "ambiguous",
-						strategy,
-						count,
-						locations: exactLocations(index, content, oldText, 5),
-					},
-				};
-			}
-			continue;
-		}
-		// trimmed_boundary needs distinct anchor lines to be meaningful; smaller
-		// patterns are already covered by line_trimmed.
-		if (strategy === "trimmed_boundary" && pattern.lines.length < 3) continue;
-		const matches = findLineMatches(index, pattern, comparatorFor(strategy));
-		if (matches.length === 1) {
-			return { ok: true, match: { strategy, start: matches[0].start, end: matches[0].end, exact: false } };
-		}
+	for (const { name, fn } of STRATEGIES) {
+		const matches = fn(content, oldText);
+		if (matches.length === 0) continue;
 		if (matches.length > 1) {
 			return {
 				ok: false,
 				failure: {
 					kind: "ambiguous",
-					strategy,
+					strategy: name,
 					count: matches.length,
-					locations: matches.slice(0, 5).map((m) => locationAt(index, content, m.start)),
+					locations: matches.slice(0, MAX_LOCATIONS).map((m) => locationAt(index, content, m.start)),
 				},
 			};
 		}
+		return {
+			ok: true,
+			match: { strategy: name, start: matches[0].start, end: matches[0].end, exact: name === "exact" },
+		};
 	}
 	return { ok: false, failure: { kind: "no_match" } };
 }

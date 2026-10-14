@@ -9,7 +9,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readFileSync } from "node:fs";
-import { runChain } from "../src/chain.js";
+import {
+	runChain,
+	strategyContextAware,
+	strategyEscapeNormalized,
+} from "../src/chain.js";
 import {
 	buildOrigToNormMap,
 	calculateLinePositions,
@@ -85,6 +89,238 @@ describe("chain: strategy selection", () => {
 		const r = runChain(content, "two\n");
 		expect(r.ok).toBe(true);
 		if (r.ok) expect(content.slice(r.match.start, r.match.end)).toBe("two\n");
+	});
+});
+
+// ── hermes corpus port (tests/tools/test_fuzzy_match.py) ─────────────────
+//
+// Ported per docs/PLAN.md's validation bar. `fuzzyReplace` mirrors hermes'
+// fuzzy_find_and_replace single-replacement path: chain + splice with reindent
+// shaping. replace_all (Tier 1 #2) and escape-drift guards (Tier 1 #3) and
+// unicode-preserving replacement opcodes (Tier 1 #4) land with those steps —
+// corpus cases needing them are ported there.
+
+function fuzzyReplace(
+	content: string,
+	oldText: string,
+	newText: string,
+): { ok: true; out: string; count: number; strategy: string } | { ok: false; error: string } {
+	const r = runChain(content, oldText);
+	if (!r.ok) {
+		return {
+			ok: false,
+			error:
+				r.failure.kind === "ambiguous"
+					? `Found ${r.failure.count} matches for old_string.`
+					: "Could not find a match for old_string in the file",
+		};
+	}
+	const { start, end, strategy, exact } = r.match;
+	const replacement = exact ? newText : reindentReplacement(oldText, newText, content.slice(start, end));
+	return { ok: true, out: content.slice(0, start) + replacement + content.slice(end), count: 1, strategy };
+}
+
+describe("corpus: TestWhitespaceDifference (hermes)", () => {
+	it("test_extra_spaces_match", () => {
+		const r = fuzzyReplace("def  foo(  x,  y  ):", "def foo( x, y ):", "def bar(x, y):");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "whitespace_normalized" });
+		if (r.ok) expect(r.out).toBe("def bar(x, y):");
+	});
+
+	it("test_boundary_space_preserved_after_match (issue #52491)", () => {
+		// A whitespace_normalized match ending in a non-space character must NOT
+		// consume the word-boundary space that follows.
+		const r = fuzzyReplace("foo   bar baz", "foo bar", "XY");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "whitespace_normalized" });
+		if (r.ok) expect(r.out).toBe("XY baz");
+	});
+
+	it("test_boundary_space_preserved_in_code_edit", () => {
+		const r = fuzzyReplace("result = compute(a,  b) + tail", "compute(a, b)", "compute(a, b, c)");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "whitespace_normalized" });
+		if (r.ok) expect(r.out).toBe("result = compute(a, b, c) + tail");
+	});
+
+	it("test_trailing_ws_still_consumed_when_match_ends_with_space", () => {
+		// Pattern's trailing space sits inside a whitespace RUN in the file —
+		// the whole run is part of the match.
+		const r = fuzzyReplace("a = foo   + bar", "foo +", "XY");
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "whitespace_normalized" });
+		if (r.ok) expect(r.out).toBe("a = XY bar");
+	});
+});
+
+describe("corpus: indentation (hermes)", () => {
+	it("TestIndentDifference.test_different_indentation", () => {
+		const r = fuzzyReplace(
+			"    def foo():\n        pass",
+			"def foo():\n    pass",
+			"def bar():\n    return 1",
+		);
+		expect(r).toMatchObject({ ok: true, count: 1 });
+		if (r.ok) expect(r.out).toContain("bar");
+	});
+
+	it("TestIndentationPreservation: unindented input re-indented to match file", () => {
+		const content = "class Calculator:\n    def add(self, a, b):\n        result = a + b\n        return result\n";
+		const r = fuzzyReplace(
+			content,
+			"result = a + b\nreturn result",
+			"result = a + b\nresult *= 2\nreturn result",
+		);
+		expect(r.ok).toBe(true);
+		if (!r.ok) return;
+		expect(r.strategy).not.toBe("exact");
+		for (const marker of ["result = a + b", "result *= 2", "return result"]) {
+			const line = r.out.split("\n").find((l) => l.includes(marker));
+			expect(line?.length).toBe(8 + marker.length); // 8-space indent
+		}
+	});
+
+	it("TestIndentationPreservation: blank lines left alone", () => {
+		const r = fuzzyReplace("    a = 1\n    b = 2\n", "a = 1\nb = 2", "a = 1\n\nb = 99");
+		expect(r.ok).toBe(true);
+		if (!r.ok) return;
+		const lines = r.out.split("\n");
+		expect(lines[0]).toBe("    a = 1");
+		expect(lines[1]).toBe("");
+		expect(lines[2]).toBe("    b = 99");
+	});
+});
+
+describe("corpus: TestUnicodeNormalized (hermes)", () => {
+	it("test_em_dash_matched", () => {
+		const r = fuzzyReplace(
+			"return value\u2014fallback",
+			"return value--fallback",
+			"return value or fallback",
+		);
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "unicode_normalized" });
+		if (r.ok) expect(r.out).toContain("return value or fallback");
+	});
+
+	// The remaining TestUnicodeNormalized/SpaceAndMinus cases (ellipsis, mixed
+	// multiline, expansion boundaries, unicode minus, ideographic space) assert
+	// the FILE's typographic characters survive the replacement — that is the
+	// unicode-preserving opcode application, landing with Tier 1 #4. Until then,
+	// pin the matching side: right strategy, right ORIGINAL bytes matched.
+	it("matches at unicode_normalized with spans into the original bytes", () => {
+		const cases: [string, string][] = [
+			["Wait for it\u2026and done", "Wait for it...and done"],
+			["value = x\u2014y\n", "value = x--y"],
+			["offset = value \u2212 1\nprint(offset)\n", "offset = value - 1"],
+			["\u6a19\u984c\u3000\u7b2c\u4e00\u7ae0\nbody text\n", "\u6a19\u984c \u7b2c\u4e00\u7ae0"],
+		];
+		for (const [content, pattern] of cases) {
+			const r = runChain(content, pattern);
+			expect(r.ok).toBe(true);
+			if (r.ok) {
+				expect(r.match.strategy).toBe("unicode_normalized");
+				expect(content.slice(r.match.start, r.match.end)).not.toContain("--"); // original bytes, not the normalized form
+			}
+		}
+		// em-dash expansion boundary: the span must snap to the expansion's
+		// original byte, not shift positions (hermes equal-boundary regression).
+		const r = runChain("value = x\u2014y\n", "value = x--y");
+		expect(r.ok).toBe(true);
+		if (r.ok) expect("value = x\u2014y\n".slice(r.match.start, r.match.end)).toBe("value = x\u2014y");
+	});
+});
+
+describe("corpus: TestBlockAnchorThreshold (hermes)", () => {
+	it("test_high_similarity_matches", () => {
+		const r = fuzzyReplace(
+			"def foo():\n    x = 1\n    y = 2\n    return x + y\n",
+			"def foo():\n    x = 1\n    y = 9\n    return x + y",
+			"def foo():\n    return 0\n",
+		);
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "block_anchor" });
+	});
+
+	it("test_completely_different_middle_does_not_match", () => {
+		const r = fuzzyReplace(
+			"class Foo:\n    completely = 'unrelated'\n    content = 'here'\n    nothing = 'in common'\n    pass\n",
+			"class Foo:\n    x = 1\n    y = 2\n    z = 3\n    pass",
+			"replaced",
+		);
+		expect(r).toMatchObject({ ok: false, error: "Could not find a match for old_string in the file" });
+	});
+});
+
+describe("corpus: escape_normalized (hermes)", () => {
+	it("literal \\t in the pattern matches the file's real tab", () => {
+		// Matching side of TestEscapeNormalizedNewString.test_tab_in_new_string_
+		// unescaped_under_escape_normalized; the new_string unescape lands in #4.
+		const content = "def hello():\n\tprint(\"before\")\n";
+		const r = runChain(content, "def hello():\n\\tprint(\"before\")\n");
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.match.strategy).toBe("escape_normalized");
+			expect(content.slice(r.match.start, r.match.end)).toBe(content);
+		}
+	});
+
+	it("literal \\r in the pattern matches the file's real CR (chain level, raw bytes)", () => {
+		// Matching side of test_carriage_return_in_new_string_unescaped. The
+		// TOOL layer pre-normalizes LF (deviations ledger #2), so a literal-\r
+		// anchor on a CRLF file falls through to the similarity rungs there;
+		// at chain level the strategy behaves exactly like hermes.
+		const content = "line1\r\nline2\r\n";
+		const r = runChain(content, "line1\\r\nline2\\r\n");
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.match.strategy).toBe("escape_normalized");
+			expect(content.slice(r.match.start, r.match.end)).toBe(content);
+		}
+	});
+
+	it("literal \\n in the pattern matches the file's real newline", () => {
+		// Matching side of TestNewlineLiteralDrift.test_drifted_line_break_rejected;
+		// the drift GUARD that blocks the write lands with Tier 1 #3.
+		const content = 'def greet():\n    print("hi")\n';
+		const r = runChain(content, 'def greet():\\n    print("hi")');
+		expect(r.ok).toBe(true);
+		if (r.ok) {
+			expect(r.match.strategy).toBe("escape_normalized");
+			expect(content.slice(r.match.start, r.match.end)).toBe(content.slice(0, -1));
+		}
+	});
+
+	it("is inert when the pattern has no escape sequences", () => {
+		expect(strategyEscapeNormalized("abc", "abc")).toEqual([]);
+		expect(strategyEscapeNormalized("a\\qb", "a\\qb")).toEqual([]);
+	});
+});
+
+describe("corpus: TestContextAwareCorrectness (hermes)", () => {
+	it("test_half_garbage_block_does_not_match", () => {
+		const r = fuzzyReplace(
+			"config_value = 100\nthreshold = 200\n",
+			"config_value = 999\ntotally_unrelated_line_here",
+			"config_value = 42\ntotally_unrelated_line_here",
+		);
+		expect(r).toMatchObject({ ok: false, error: "Could not find a match for old_string in the file" });
+	});
+
+	it("test_all_lines_matching_still_replaces (lands at block_anchor per chain order)", () => {
+		const r = fuzzyReplace(
+			"alpha one\nbeta two\ngamma three\n",
+			"alpha one\nbeta 2\ngamma three",
+			"alpha one\nbeta TWO\ngamma three",
+		);
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "block_anchor" });
+		if (r.ok) expect(r.out).toContain("beta TWO");
+	});
+
+	it("test_no_match_on_large_file_is_fast (anchor pre-filter)", () => {
+		const big = Array.from({ length: 10000 }, (_, i) => `line ${i} content here`).join("\n");
+		const patt = Array.from({ length: 40 }, (_, i) => `nomatch xyzzy ${i}`).join("\n");
+		const start = performance.now();
+		const matches = strategyContextAware(big, patt);
+		const elapsed = (performance.now() - start) / 1000;
+		expect(matches).toEqual([]);
+		// Was ~5.5s before anchoring in hermes; generous ceiling to avoid CI flake.
+		expect(elapsed).toBeLessThan(2.0);
 	});
 });
 
@@ -202,9 +438,21 @@ describe("tool: execute against real files", () => {
 
 	it("returns a success-shaped no-op for an already-applied edit", async () => {
 		const { dir, file, name } = await tmpFile("value = 42\n");
-		const res = await run({ path: name, edits: [{ oldText: "value = 41", newText: "value = 42" }] }, dir);
+		// oldText must be unmatchable by the FULL chain: context_aware matches
+		// near-misses at >=0.80 similarity, and "value = 41" vs "value = 42" is 0.9.
+		const res = await run({ path: name, edits: [{ oldText: "zzz = 41", newText: "value = 42" }] }, dir);
 		const text = res.content.map((c) => (c as { text: string }).text).join("");
 		expect(text).toMatch(/already applied/);
+		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
+	});
+
+	it("context_aware matches near-miss anchors like hermes (0.9 similarity)", async () => {
+		// hermes applies this edit too: the chain runs BEFORE already-applied
+		// detection (_no_match_result only sees genuine no-matches).
+		const { dir, file, name } = await tmpFile("value = 42\n");
+		const res = await run({ path: name, edits: [{ oldText: "value = 41", newText: "value = 42" }] }, dir);
+		const text = res.content.map((c) => (c as { text: string }).text).join("");
+		expect(text).toMatch(/Successfully replaced/);
 		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
 	});
 
@@ -216,9 +464,12 @@ describe("tool: execute against real files", () => {
 	});
 
 	it("no-match errors carry the did-you-mean sections", async () => {
+		// "function comput() {...}" is 0.974 similar to the file's first line —
+		// context_aware matches it (hermes parity). Use a first line below the
+		// 0.80 bar ("def comput..." is 0.706) but above the 0.30 suggestion floor.
 		const { dir, name } = await tmpFile("function compute() {\n\treturn 7;\n}\n");
 		await expect(
-			run({ path: name, edits: [{ oldText: "function comput() {\n\treturn 7;\n}", newText: "x" }] }, dir),
+			run({ path: name, edits: [{ oldText: "def comput() {\n\treturn 7;\n}", newText: "x" }] }, dir),
 		).rejects.toThrow(/Did you mean one of these sections\?/);
 	});
 

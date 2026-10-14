@@ -22,7 +22,7 @@ dual-mode surface — onto pi.
 
 | | `edit` (built-in) | `patch` (this extension) |
 |---|---|---|
-| Matching | exact `indexOf`, one fuzzy fallback, hard stop | ordered chain, hermes' 9 strategies (first four implemented; PLAN.md Tier 1 completes it) |
+| Matching | exact `indexOf`, one fuzzy fallback, hard stop | ordered chain, hermes' 9 strategies (implemented; PLAN.md Tier 1) |
 | Uniqueness | counted in normalized space (can false-flag ambiguity) | counted **per strategy**, in that strategy's space |
 | Not-found error | "must match exactly" | `Did you mean one of these sections?` + numbered snippets, whitespace visualization (`file has: ····→code`) |
 | Ambiguous error | "Found N occurrences" | `Found N matches` + up to 5 `L<line>: snippet` locations |
@@ -76,14 +76,13 @@ Give the model the same edit both ways:
 checklist, validation bar, and the deviations ledger that records every intentional difference
 from hermes. Update it as work lands.
 
-Short version: done so far are the chain's first four strategies (`exact`, `line_trimmed`,
-`indentation_flexible`, `trimmed_boundary`), teaching errors (did-you-mean sections, whitespace
-visualization, ambiguity locations), the already-applied no-op, the model-facing unified diff
-+ own preview renderer, reindent shaping, and argument normalization. Remaining: the rest of
-the 9-strategy chain + `replace_all` + escape-drift guards (Tier 1), the schema switch to
-hermes' single-replacement surface and failure escalation (Tier 2), the V4A `mode:"patch"`
-port (Tier 3), and operational parity — post-write verification, staleness tracking, strategy
-telemetry (Tier 4).
+Short version: done so far is the full 9-strategy chain (`exact` through `context_aware`, in
+hermes' order), teaching errors (did-you-mean sections, whitespace visualization, ambiguity
+locations), the already-applied no-op, the model-facing unified diff + own preview renderer,
+reindent shaping, and argument normalization. Remaining: `replace_all` + escape-drift guards
++ unicode-preserving replacement (Tier 1), the schema switch to hermes' single-replacement
+surface and failure escalation (Tier 2), the V4A `mode:"patch"` port (Tier 3), and
+operational parity — post-write verification, staleness tracking, strategy telemetry (Tier 4).
 
 ## Development
 
