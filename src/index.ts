@@ -1,7 +1,8 @@
 /**
- * pi-patch — a pi extension registering a `patch` tool alongside the built-in
- * `edit` tool (never instead of it, so devs can A/B the two matching engines
- * in one session without hindering abilities).
+ * pi-patch — a pi extension registering a `patch` tool: an exact port of
+ * hermes' `patch` tool, alongside the built-in `edit` tool (never instead of
+ * it, so devs can A/B the two matching engines in one session without
+ * hindering abilities; deviations ledger #1).
  *
  * Load in development:
  *   pi --extension /path/to/pi-patch/src/index.ts

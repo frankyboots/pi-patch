@@ -1,7 +1,7 @@
 {
 	"name": "pi-patch",
 	"version": "0.1.0",
-	"description": "pi extension: a 'patch' tool that runs alongside the built-in edit tool — hermes-style tolerant matching (whitespace/indentation), teaching errors with 'did you mean' sections, and model-facing diffs. Lets devs A/B test the matching engines without overriding anything.",
+	"description": "pi extension: an exact port of hermes' 'patch' tool — tolerant 9-strategy matching, teaching errors with 'did you mean' sections, model-facing diffs, and a V4A apply_patch mode — registered alongside the built-in edit tool for A/B testing.",
 	"type": "module",
 	"main": "src/index.ts",
 	"scripts": {

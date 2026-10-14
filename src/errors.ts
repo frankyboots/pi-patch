@@ -1,5 +1,6 @@
 /**
- * Teaching errors — the real differentiator (analysis §4, Tier 1 #2/#5).
+ * Teaching errors — the real differentiator (analysis §4; target texts are
+ * Appendix B verbatim, modulo pi tool names per deviations ledger #10).
  *
  * Every failure is a teaching moment with data: ambiguity errors name the
  * match locations, no-match errors show the closest sections ("did you

@@ -1,5 +1,5 @@
 /**
- * pi-patch test corpus — Tier 1 acceptance per docs/EDIT-TOOL-ANALYSIS.md §9:
+ * pi-patch test corpus — Tier 1 acceptance per docs/PLAN.md:
  * the strategy chain, per-strategy uniqueness counting, replacement shaping,
  * teaching errors, and the tool-level file behaviors (multi-edit, overlap,
  * CRLF/BOM, already-applied no-op, argument normalization).

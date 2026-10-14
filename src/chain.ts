@@ -1,11 +1,15 @@
 /**
- * Ordered match-strategy chain for `patch` — Tier 1 of the port plan in
- * docs/EDIT-TOOL-ANALYSIS.md §9:
+ * Ordered match-strategy chain for `patch` — following hermes' reference
+ * order (docs/EDIT-TOOL-ANALYSIS.md Appendix A):
  *
- *   exact → line_trimmed → indentation_flexible → trimmed_boundary
+ *   exact → line_trimmed → whitespace_normalized → indentation_flexible
+ *         → escape_normalized → trimmed_boundary → unicode_normalized
+ *         → block_anchor → context_aware
  *
- * Ported from hermes' fuzzy_match.py design (9 strategies; we start with the
- * four that need no span algebra). Key properties copied verbatim:
+ * The first four are implemented (the ones needing no span algebra); Tier 1
+ * of the exact-port plan (docs/PLAN.md) adds the missing five in exactly
+ * this order.
+ * Ported from hermes' fuzzy_match.py. Key properties copied verbatim:
  *
  * - First strategy with ≥1 match wins; >1 match → ambiguous error with the
  *   match locations. No fall-through past an ambiguous result.

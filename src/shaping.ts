@@ -1,12 +1,13 @@
 /**
- * Replacement shaping for fuzzy matches (port plan §3.3 / Tier 2 #8, first
- * slice): when the match was not exact, the file region differs from oldText,
+ * Replacement shaping for fuzzy matches (analysis §3.3, first slice): when
+ * the match was not exact, the file region differs from oldText,
  * and splicing newText verbatim can corrupt style. Re-anchors newText's base
  * indent onto the file's actual indent while preserving relative nesting, so
  * an unindented model replacement lands correctly inside a nested block.
  *
  * Simplified port of hermes' `_reindent_replacement` (first-line anchoring
- * with per-line prefix swap). Unicode-preserving opcodes come later (Tier 2).
+ * with per-line prefix swap). Unicode-preserving opcodes come later
+ * (PLAN.md Tier 1 #4).
  */
 function firstLine(text: string): string {
 	const idx = text.indexOf("\n");

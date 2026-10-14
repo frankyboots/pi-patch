@@ -1,10 +1,14 @@
 /**
- * The `patch` tool definition: pi's edit-tool skeleton (multi-edit per call,
- * all-or-nothing, overlap detection, LF pre-normalization + BOM/CRLF handling,
- * mutation queue, argument normalization, constrained sampling) with the
- * hermes-style strategy chain and teaching errors wired into the matching
- * core. Registered under a separate name so it runs alongside `edit`, never
- * instead of it (analysis §8–9).
+ * The `patch` tool definition — an exact port of hermes' `patch` tool
+ * (docs/EDIT-TOOL-ANALYSIS.md). The argument surface is transitional: pi's
+ * multi-edit `edits[]` schema (all-or-nothing, overlap detection, LF
+ * pre-normalization + BOM/CRLF handling, mutation queue, argument
+ * normalization, constrained sampling) until the reschema to hermes'
+ * single-replacement surface (`old_string`/`new_string`/`replace_all`,
+ * PLAN.md Tier 2 #5) and the V4A `mode:"patch"` mode (Tier 3) land.
+ * The matching core already follows hermes: strategy chain + teaching
+ * errors. Registered under a separate name so it runs alongside `edit`,
+ * never instead of it (deviations ledger #1).
  */
 import { constants } from "node:fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
@@ -59,7 +63,7 @@ export interface PatchToolDetails {
 	firstChangedLine?: number;
 }
 
-/** Non-blank length threshold for the already-applied no-op guard (analysis §9 Tier 1 #3). */
+/** Non-blank length threshold for the already-applied no-op guard (conservative by design — see docs/PLAN.md status snapshot). */
 const ALREADY_APPLIED_MIN_CHARS = 8;
 
 export const patchToolSystemPromptContribution = {

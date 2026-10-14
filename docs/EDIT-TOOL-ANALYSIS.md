@@ -1,7 +1,9 @@
 # Edit Tool Analysis: Hermes `patch` vs Pi `edit`
 
-**Date:** 2026-02-14
+**Date:** 2026-02-14 (goal revised)
 **Question:** Why do small local models reliably succeed with hermes' edit tool but struggle with pi's? Can we build the same tool for pi?
+
+**Goal:** pi-patch is an **exact port of the hermes `patch` tool** — same dual-mode surface (replace + V4A patch), same 9-strategy chain, same recovery UX and error texts — adapted to pi only where the platform forces a difference. Every deviation from hermes behavior must carry a row in the deviations ledger (see [PLAN.md](PLAN.md)) with its rationale; "pi already has something similar" is not a reason to skip a hermes behavior. Earlier revisions of this document framed the port as "keep pi's edit skeleton, borrow the matching core"; that framing is retired.
 
 **Sources examined:**
 
@@ -11,6 +13,7 @@
 | pi extension API | `dist/core/agent-session.js` (`_refreshToolRegistry`), `docs/extensions.md`, `dist/index.d.ts` |
 | hermes edit tool | `~/.hermes/hermes-agent/tools/file_tools.py` (`patch_tool`, `PATCH_SCHEMA`) |
 | hermes matching engine | `tools/fuzzy_match.py` (663 lines), `tools/file_operations.py` (`patch_replace`) |
+| hermes V4A patch parser | `tools/patch_parser.py` (452 lines: `parse_v4a_patch`, `apply_v4a_operations`) |
 | hermes support infra | `tools/file_state.py`, `tools/file_tools_read_tracking.py`, `tests/tools/test_fuzzy_match.py` |
 
 ---
@@ -24,7 +27,7 @@ The two tools share the same user-visible concept ("find unique text, replace it
 
 The gap is not "fuzzy matching" as a buzzword — it is that hermes treats **every failure mode of LLM-generated edit arguments as a first-class case** with a tailored response, while pi treats anything short of near-exact input as user error. Small models produce exactly the argument shapes hermes handles (stripped indentation, collapsed whitespace, double-escaped strings, re-sent edits); hermes converts those into successes or informed second attempts. That is the whole difference.
 
-**Port verdict: fully feasible.** pi's extension API allows an extension to register a tool named `edit` that replaces the built-in (extension tools overwrite built-ins by name in `_refreshToolRegistry` — the override `set` is at `agent-session.js:2894`), including its model-facing description, prompt guidelines, and renderer. `withFileMutationQueue` and `createEditToolDefinition` are public exports. Recommended approach: keep pi's multi-edit/overlap/CRLF/BOM/mutation-queue skeleton, port hermes' strategy chain + recovery UX into the matching core. Details and a tiered plan in §8–9.
+**Port verdict: fully feasible — and the goal is fidelity, not inspiration.** pi's extension API registers tools under any name (`patch` runs alongside the built-in `edit`, which stays available for A/B comparison), and `withFileMutationQueue` is a public export. The port target is the hermes `patch` tool **as it actually exists**: a dual-mode tool — `replace` (the 9-strategy fuzzy find-and-replace this document mostly describes) and `patch` (OpenAI's V4A `apply_patch` dialect for multi-file/multi-hunk edits, §2.1) — plus its recovery system. Both modes share one matching core: V4A Update hunks are applied through the same `fuzzy_find_and_replace` chain (`patch_parser.py:422`), so the chain is the load-bearing port for both. Where pi's platform forces a difference (no task registry, no lint/LSP harness, text result envelope), the deviation is recorded with rationale in PLAN.md's deviations ledger, not silently dropped. The exact-port build plan, validation bar, and live status live in [PLAN.md](PLAN.md).
 
 ---
 
@@ -33,7 +36,8 @@ The gap is not "fuzzy matching" as a buzzword — it is that hermes treats **eve
 | Aspect | pi `edit` | hermes `patch` |
 |---|---|---|
 | Arguments | `path`, `edits[] {oldText, newText}` | `path`, `old_string`, `new_string`, `replace_all` |
-| Edits per call | **Multiple** disjoint edits, all matched against the original file, overlap detected | **One** replacement per call (multi-file/multi-hunk via a separate V4A `apply_patch` mode shown only to OpenAI-family models) |
+| Modes | single | dual: `mode="replace"` (default) / `mode="patch"` — V4A dialect (§2.1); schema-gated to OpenAI-family models, handler accepts both from any model |
+| Edits per call | **Multiple** disjoint edits, all matched against the original file, overlap detected | **One** replacement per call in replace mode; multi-file/multi-hunk edits are the V4A patch mode's job (§2.1) |
 | `replace_all` | ❌ (uniqueness required per edit) | ✅ (restricted to exact/whitespace-tolerant strategies) |
 | Malformed-arg recovery | `prepareEditArguments`: JSON-string `edits`, single-object, legacy flat `oldText/newText` | `schema_sanitizer.py` coercion layer |
 | Constrained sampling | ✅ strict-prefer JSON schema | ❌ |
@@ -46,6 +50,34 @@ The gap is not "fuzzy matching" as a buzzword — it is that hermes treats **eve
 Scope note on that last row: "`patch` warns only" refers to the *read-staleness* gate. `patch_tool` still runs hard pre-write safety gates via `_write_precheck_error` (`file_tools.py:769`): sensitive-path denylist, binary-document write guard, protected-instruction-file guard, approval-required gate, and the cross-profile mirror guard. For the pi port these are out of scope (pi handles approval outside the tool), but "no guards" would be the wrong takeaway.
 
 Note the schema texts: pi's description *demands exactness*, hermes' *promises tolerance*. This matters more than it seems — a weak model reading "must match exactly" makes brittle attempts and gets terse rejections; hermes' schema invites the attempt and the implementation backs it up.
+
+### 2.1 The second mode: V4A `apply_patch` (the part an exact port must not skip)
+
+`patch_tool` is dual-mode (`file_tools.py:957`): `mode="replace"` (default) runs the fuzzy find-and-replace described in §3–4; `mode="patch"` applies a V4A patch — OpenAI's `apply_patch` dialect:
+
+```
+*** Begin Patch
+*** Update File: path/to/file
+@@ context hint @@
+ context line
+-removed line
++added line
+*** Add File: new/path
+*** Delete File: old/path
+*** Move File: a -> b
+*** End Patch
+```
+
+Implementation (`tools/patch_parser.py`, 452 lines):
+
+- `parse_v4a_patch` → typed operations (`Update`/`Add`/`Delete`/`Move`, each with hunks of prefixed lines and an optional `@@ hint @@`).
+- `_validate_operations` — pre-flight pass before any write: every Update target must be readable; Add targets must not already exist.
+- `apply_v4a_operations` — per-op appliers (`_apply_add`/`_apply_delete`/`_apply_move`/`_apply_update`) dispatched with per-verb error text.
+- **Update hunks reuse the 9-strategy chain**: `_apply_update` (`patch_parser.py:403`) splits each hunk into search lines (context+removed) and replace lines (context+added) and calls `fuzzy_find_and_replace`; on a miss it retries inside a window around the context hint (−500/+2000 chars), then attaches the shared `format_no_match_hint` "did you mean" text. The chain is therefore the matching core for BOTH modes.
+- Addition-only hunks (no search lines) insert after the `@@ hint @@` (unique occurrence required) or append at EOF as a safe fallback (`_insert_addition_only`).
+- Tool-layer plumbing (`file_tools.py:928`): `_collect_v4a_header_paths` extracts every path named in headers, rejecting `..` traversal; `_rewrite_v4a_patch_paths_for_host` rewrites headers to resolved host paths; locks are taken in sorted, deduplicated order across all files in the patch (deadlock avoidance); `_write_precheck_error` gates run over the union of paths; the result reports absolute `files_modified` (+ `resolved_path` when a single file).
+- **Schema gating** (`file_tools.py:1186-1257`): `PATCH_SCHEMA` is replace-only. `_patch_schema_overrides()` layers `mode`+`patch` params and a dual-mode description onto the schema only when `_is_openai_family_main()` — V4A is the dialect OpenAI-family models emit natively, and advertising it to everyone cost ~148 tok/call of schema. The check is provider-allowlist + model-slug heuristics (`gpt-*`/`o1`/`o3`/`o4`/`o5`/`codex`/`chatgpt`, `openai/` in model), fail-closed to replace-only. The **handler accepts both shapes from ANY model** (`mode` defaults to `replace`) for replay compat and strong models that know V4A anyway.
+- Failure escalation (§4) counts replace-mode misses only — "V4A misses are rare" (`file_tools.py:1022`).
 
 ---
 
@@ -148,36 +180,22 @@ pi, by contrast, has one tolerance layer and then assigns blame ("must match exa
 
 ---
 
-## 6. Where pi is genuinely better
+## 6. pi advantages → dispositions under the exact-port goal
 
-Fair assessment — a port should keep these:
+This section used to list "what a port should keep". Under the exact-port goal these are
+**candidate deviations**, each with an explicit disposition (ledger: [PLAN.md](PLAN.md)):
 
-1. **Multi-edit per call with overlap detection.** One round trip for N disjoint changes; hermes' replace mode is one edit per call (its multi-hunk answer, V4A `apply_patch`, is deliberately hidden from non-OpenAI models because it cost ~148 tok/call of schema).
-2. **Constrained sampling** (`strict: "prefer"`) on the JSON schema — structurally prevents malformed calls hermes has to sanitize.
-3. **Simplicity = predictability.** A single fuzzy fallback has a near-zero false-positive surface. A 9-strategy chain *can* match the wrong region; hermes manages the risk (similarity thresholds tuned from observed mis-matches — the code comment notes 0.10/0.30 thresholds "matched unrelated blocks"), drift guards, and post-write verification, but the risk is real and must be ported with the mitigations, not just the strategies.
-4. **BOM/CRLF/LF handling and mutation queue** are solid; reuse them. (Hermes strips BOM in `patch_replace` too, so BOM is parity; pi's actual edge is pre-normalizing CRLF before matching — see §3.3.)
-5. **UI rendering integration** (`editRenderers`, details.diff) — keep, while ALSO putting the diff in model-facing content.
-
----
-
-## 7. Complexity & risk ledger (for the port decision)
-
-| Item | LOC (hermes, py) | Port risk |
-|---|---|---|
-| Strategy chain core | ~450 (`fuzzy_match.py` incl. span mapping) | Moderate — the span-mapping helpers (`_map_normalized_positions`, `_build_orig_to_norm_map`) are subtle; port with tests, don't reimplement from the table |
-| `SequenceMatcher` equivalent | — | No new dependency needed: pi's `edit-diff.js` already imports the `diff` npm package, and `difflib.ratio` (`2·M/T`) is computable from `Diff.diffChars` opcodes (`M` = total matched length). Similarity thresholds must still be re-validated against the same fixtures |
-| Escape-drift guards | ~120 | Low — pure string logic |
-| Recovery UX (hints, locations, escalation) | ~150 + failure/read trackers | Low-Medium; trackers are session-scoped state in an extension (fine), pi has no built-in persistence for these |
-| Already-applied detection | ~15 | Trivial |
-| Reindent + unicode-preserving replacement | ~110 | Moderate — most intricate correctness code in the file |
-| Post-write verification | ~30 | Trivial |
-| Staleness/read tracking | optional | Medium — hermes' version spans 2 modules + cross-agent registry; a thin read-time vs edit-time check suffices, but compare a version tuple (ino+size+ctime, optionally mtime_ns), not bare mtime — editors/copy tools can preserve mtime |
-
-Also plan for pi-specific integration: the chain must run **per edit within `edits[]`, all matched against the same original content** (pi semantics), all-or-nothing, preserving pi's overlap check. `replace_all` does not exist in pi's schema — decide whether to add it (hermes' exact-only restriction makes it safe) or leave it out.
+1. **Multi-edit per call with overlap detection** — **DROP for parity** (planned as PLAN.md Tier 2 #5). Replace mode becomes hermes' single `old_string`/`new_string`/`replace_all` call; multi-hunk and multi-file edits are the V4A patch mode's job, exactly as in hermes. The built-in `edit` tool keeps pi's multi-edit semantics available, so the capability is not lost — and the A/B comparison stays meaningful (same job, two tool shapes).
+2. **Constrained sampling** (`strict: "prefer"`) — **KEEP** (platform bonus, ledger #7). Orthogonal to tool semantics; hermes compensates with its `schema_sanitizer.py` coercion layer, which our argument normalization mirrors (ledger #8).
+3. **CRLF pre-normalization before matching** — **KEEP as a deliberate improvement** (ledger #2). Hermes matches raw CRLF bytes, so bare-LF `old_string`s — what models emit — fail strategies 1/3/4/6 there; we normalize to LF, match with the full chain, and restore endings on write. Strictly stronger, and the schema text's tolerance promise demands it (§3.3).
+4. **BOM handling** — parity, not a deviation (both strip before matching, restore on write).
+5. **`withFileMutationQueue`** — **KEEP** as the platform equivalent of hermes' `lock_path` (ledger #3). For multi-file V4A patches, queue every touched path in hermes' sorted order.
+6. **UI rendering integration** (`editRenderers`, `details.diff`) — **KEEP** (pi-platform presentation, ledger #6); the unified diff still goes to model-facing content (§4).
+7. **Risk posture of the 9-strategy chain** — **PORT WITH THE MITIGATIONS.** A permissive chain *can* match the wrong region; hermes manages the risk (similarity thresholds tuned from observed mis-matches — the code comment notes 0.10/0.30 thresholds "matched unrelated blocks"; replace_all exclusion for similarity strategies; drift guards; post-write verification). Exact port means shipping the mitigations, not just the strategies.
 
 ---
 
-## 8. Port feasibility for pi — confirmed
+## 7. Port feasibility for pi — confirmed
 
 Verified mechanisms:
 
@@ -188,45 +206,13 @@ Verified mechanisms:
 - **⚠ The TUI preview is hard-wired to the old engine — the port must replace it.** The built-in `editRenderers.renderCall` computes the live preview by calling core's `computeEditsDiff` **directly** (`dist/core/tools/renderers/edit.js:128`), which runs the *built-in* matcher. Reusing the built-in renderer wholesale (the tempting `next() ?? mine`) means previews say "Could not find the exact text…" for edits the new tool would happily land. The extension needs its own `renderCall` that mirrors the built-in component (header, success/error background, diff body) but computes the preview with the new engine — while still populating `details.diff`/`details.firstChangedLine`, because `renderResult` reads exactly those fields.
 - **Structured result channel (optional):** `ToolDefinition.outputSchema`/`structuredContent` exists; `structuredContent` is not sent to the model (codemode scripts receive it), so it's a clean channel for a machine-readable lint/diagnostics payload without JSON-in-text.
 - **Telemetry:** a `tool_result` handler or in-tool counter writing to a JSONL file reproduces hermes' `note_edit_match` loop.
+- **V4A mode:** the parser is self-contained string/regex work — a direct TS port with `tests/tools/test_patch_parser.py` as the corpus. The model-family gate maps to pi's `PI_PROVIDER`/`PI_MODEL` env vars (`docs/environment-variables.md:28-29`; session-API access to the live model should be verified at implementation time), fail-closed to replace-only exactly like hermes. Multi-file locking maps to `withFileMutationQueue` over all touched paths in hermes' sorted order.
 
-So: an extension `pi-patch` (fitting this project's name) can ship a drop-in `edit` replacement with zero pi core changes. If it proves itself, upstreaming into `edit-diff.js` is the endgame — the architecture maps cleanly (insert the strategy chain where `fuzzyFindText` currently returns `found:false`).
-
----
-
-## 9. Recommended build plan
-
-**Tier 1 — biggest win per line, low risk (do first):**
-1. Strategy chain entries 2, 4, 6 (`line_trimmed`, `indentation_flexible`, `trimmed_boundary`) — pure line-array comparisons, no span algebra, covers the dominant small-model failure (indent).
-2. Teaching errors: ambiguity errors with `L<line>: snippet` locations; no-match error with closest-sections "did you mean" + whitespace visualization.
-3. Already-applied no-op (success-shaped), with hermes' conservative guard: fire only when `new_string` (≥ 8 non-blank chars) is present exactly and `old_string` is gone.
-4. Put the unified diff into model-facing `content` (keep `details` for the UI).
-5. Old_string validation: empty/whitespace-only/identical → actionable text with "do not re-send unchanged".
-6. Own preview renderer: mirror the built-in edit `renderCall` but compute the preview with the new engine (the built-in one is hard-wired to core's `computeEditsDiff`, §8); keep `details.diff`/`firstChangedLine` populated for `renderResult`.
-
-**Tier 2 — full hermes parity:**
-6. Strategies 3, 5, 7 (`whitespace_normalized`, `escape_normalized`, `unicode_normalized`) with the span-mapping helpers ported from hermes verbatim. Count ambiguity per-strategy, in that strategy's space (pi's normalize-then-count causes false ambiguity, §3.1).
-7. Escape-drift guards (newline-literal, quote-suspect, backslash-doubling) before applying any non-exact match.
-8. Replacement shaping: `_reindent_replacement` + unicode-preserving opcodes.
-9. Strategies 8–9 (similarity) with hermes' 0.50/0.70/0.80 thresholds and `replace_all` exclusion (if `replace_all` is added).
-10. Per-path failure counter + escalation hint (extension-session state), including both halves of hermes' state machine: reset-on-success, and the generic below-threshold `_hint` when no richer snippet is attached (§4).
-
-**Tier 3 — operational polish:**
-11. Post-write verification re-read.
-12. Read-time version capture (ino+size+ctime, not bare mtime) → staleness warning at edit time.
-13. Strategy telemetry (JSONL) to drive threshold tuning on *our* traffic.
-14. Optional: V4A `mode:"patch"` behind a model-family check, only if OpenAI-family usage justifies the schema tokens.
-
-**Keep from pi:** `edits[]` multi-edit + overlap detection (run the chain per edit against the same snapshot, all-or-nothing), `prepareEditArguments` normalization, LF pre-normalization + BOM/CRLF handling, `withFileMutationQueue`, constrained sampling. The renderer needs a port-specific variant (Tier 1 #6), not a reuse. Adapt hermes' hint texts to pi's tool names: `write_file` → `write`, `read_file` → `read`, `search_files` → `grep`/`find`.
-
-**Validation plan:**
-- Port hermes' `tests/tools/test_fuzzy_match.py` corpus (57 cases) to vitest — it encodes years of regression history; passing it is the port's acceptance bar.
-- Add a differential fixture: every case where pi's current tool returns `found:false` should be enumerated and asserted as matched by the new chain (or intentionally still rejected, e.g. escape-drift).
-- A/B on small local models (pi's llama.cpp provider path): metrics = edit success per call, retries per landed edit, turns per successful edit session, corruption incidents (should remain zero).
-- Ship behind the extension first; promote into core `edit-diff.js` after the metrics agree.
+So: an extension `pi-patch` can ship a fidelity `patch` port alongside the built-in `edit` with zero pi core changes. If it proves itself, upstreaming into `edit-diff.js` is the endgame — the architecture maps cleanly (insert the strategy chain where `fuzzyFindText` currently returns `found:false`).
 
 ---
 
-## 10. Appendix A — hermes strategy chain, reference ordering
+## Appendix A — hermes strategy chain, reference ordering
 
 ```
 exact → line_trimmed → whitespace_normalized → indentation_flexible
@@ -246,3 +232,4 @@ exact → line_trimmed → whitespace_normalized → indentation_flexible
 - *Backslash doubling:* "…every backslash run in old_string is exactly twice as long as in the matched region… arguments were JSON-escaped one extra time…"
 - *Escalation:* "This is failure #3 patching 'x.py'. Stop retrying with variations of the same old_string. Either (1) re-read the file fresh…, (2) use a longer / more unique old_string…, or (3) use write_file…"
 - *Already applied:* "File already contains the target text — the edit appears to be already applied… No write performed; do not re-send this patch."
+- *V4A hunk miss:* "Could not apply hunk: …" + the shared "did you mean" hint (`patch_parser.py:446`); failure escalation is replace-mode only (§2.1).

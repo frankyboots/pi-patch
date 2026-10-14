@@ -5,7 +5,7 @@
  * state-colored background, async diff preview, result diff), but computes
  * the preview with OUR chain via computePatchDiff — the built-in renderer is
  * hard-wired to core's computeEditsDiff and would show "could not find"
- * errors for edits this tool lands fine (analysis §8 ⚠). Diff body coloring
+ * errors for edits this tool lands fine (analysis §7 ⚠). Diff body coloring
  * is reimplemented with public theme keys instead of importing pi-internal
  * components.
  */
