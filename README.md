@@ -23,6 +23,7 @@ dual-mode surface — onto pi.
 | | `edit` (built-in) | `patch` (this extension) |
 |---|---|---|
 | Matching | exact `indexOf`, one fuzzy fallback, hard stop | ordered chain, hermes' 9 strategies (implemented; PLAN.md Tier 1) |
+| Call shape | `edits[]` batch, all-or-nothing | hermes' flat surface: `path` + `old_string` + `new_string` + `replace_all`, **one replacement per call** |
 | Uniqueness | counted in normalized space (can false-flag ambiguity) | counted **per strategy**, in that strategy's space |
 | Not-found error | "must match exactly" | `Did you mean one of these sections?` + numbered snippets, whitespace visualization (`file has: ····→code`) |
 | Ambiguous error | "Found N occurrences" | `Found N matches` + up to 5 `L<line>: snippet` locations |
@@ -33,10 +34,13 @@ dual-mode surface — onto pi.
 
 Kept from pi (each a row in the PLAN.md deviations ledger): LF pre-normalization + BOM/CRLF
 handling, `withFileMutationQueue`, constrained sampling, renderer integration, argument
-normalization. The current `edits[]` multi-edit schema is **transitional** — the plan (PLAN.md
-Tier 2 #5) switches `patch` to hermes' single-replacement surface
-(`old_string`/`new_string`/`replace_all`), with multi-hunk/multi-file work moving to the V4A
-patch mode (Tier 3), exactly as in hermes; the built-in `edit` keeps multi-edit available.
+normalization. `patch` speaks hermes' single-replacement surface
+(`old_string`/`new_string`/`replace_all`, Tier 2 #5): one replacement per call, with
+multi-hunk/multi-file work reserved for the V4A patch mode (Tier 3), exactly as in hermes.
+Models trained on `edit` are still understood — `preparePatchArguments` maps
+`oldText`/`newText`/`replaceAll`/`file_path` and a single-entry `edits[]` onto hermes' names —
+but a call asking for several replacements is refused, never half-applied (ledger #14). The
+built-in `edit` keeps multi-edit batching available.
 
 ## Install
 
@@ -64,7 +68,7 @@ aliased by pi itself).
 Give the model the same edit both ways:
 
 - `edit` a line but with the indentation you *remembered* (wrong) → terse failure.
-- `patch` the same wrong-indentation `oldText` → matches (line-trimmed tolerance), the
+- `patch` the same wrong-indentation `old_string` → matches (line-trimmed tolerance), the
   replacement is re-indented onto the file's style, and the model sees the diff.
 - `patch` a genuinely absent text → the error shows the closest sections so the next
   attempt is informed, not blind.
@@ -76,14 +80,15 @@ Give the model the same edit both ways:
 checklist, validation bar, and the deviations ledger that records every intentional difference
 from hermes. Update it as work lands.
 
-Short version: done so far is the full 9-strategy chain (`exact` through `context_aware`, in
-hermes' order), teaching errors (did-you-mean sections, whitespace visualization, ambiguity
-locations), the already-applied no-op, the model-facing unified diff + own preview renderer,
-reindent shaping, hermes' `replace_all` (per-edit `replaceAll` under the transitional
-surface), and argument normalization. Remaining: escape-drift guards
-+ unicode-preserving replacement (Tier 1), the schema switch to hermes' single-replacement
-surface and failure escalation (Tier 2), the V4A `mode:"patch"` port (Tier 3), and
-operational parity — post-write verification, staleness tracking, strategy telemetry (Tier 4).
+Short version: replace mode is ported. Done so far: the full 9-strategy chain (`exact`
+through `context_aware`, in hermes' order), the escape-drift guards, replacement shaping
+(reindent, unicode-preserving opcodes, conditional `\t`/`\r` unescape), hermes' `replace_all`,
+hermes' flat surface with hermes' argument gates (Tier 2 #5), teaching errors byte-exact to
+Appendix B modulo pi tool names, the already-applied no-op, the model-facing unified diff +
+own preview renderer, and argument normalization. Remaining: the failure counter + escalation
+(Tier 2 #6), the V4A `mode:"patch"` port (Tier 3 — the handler already *accepts* `mode`/`patch`
+and refuses with "not available in this build" until then, ledger #15), and operational parity
+— post-write verification, staleness tracking, strategy telemetry (Tier 4).
 
 ## Development
 
@@ -96,7 +101,7 @@ Layout:
 
 ```
 src/index.ts     extension entry — registers `patch` + renderers
-src/tool.ts      tool definition: pi edit skeleton + chain + teaching errors
+src/tool.ts      tool definition: hermes' flat surface + arg gates + shaping orchestrator
 src/chain.ts     ordered strategy chain (spans into LF-normalized content)
 src/shaping.ts   replacement shaping: conditional \t/\r unescape, unicode-preserving
                  opcodes (verbatim difflib.SequenceMatcher port), reindent, splice

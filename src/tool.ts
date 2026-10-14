@@ -1,70 +1,90 @@
 /**
- * The `patch` tool definition — an exact port of hermes' `patch` tool
- * (docs/EDIT-TOOL-ANALYSIS.md). The argument surface is transitional: pi's
- * multi-edit `edits[]` schema (all-or-nothing, overlap detection, LF
- * pre-normalization + BOM/CRLF handling, mutation queue, argument
- * normalization, constrained sampling) until the reschema to hermes'
- * single-replacement surface (`old_string`/`new_string`/`replace_all`,
- * PLAN.md Tier 2 #5) and the V4A `mode:"patch"` mode (Tier 3) land.
- * The matching core already follows hermes: strategy chain + teaching
- * errors. Registered under a separate name so it runs alongside `edit`,
- * never instead of it (deviations ledger #1).
+ * The `patch` tool definition — an exact port of hermes' `patch` replace mode
+ * (docs/EDIT-TOOL-ANALYSIS.md §2, §6 item 1). The surface is hermes':
+ * `path` + `old_string` + `new_string` + `replace_all`, **one replacement per
+ * call** (multi-hunk/multi-file work is the V4A patch mode's job, Tier 3). The
+ * matching core is hermes' too: the 9-strategy chain, the escape-drift guards,
+ * the orchestrator tail (conditional `\t`/`\r` unescape, unicode-preserving
+ * opcodes, reindent, splice) and the teaching errors.
+ *
+ * Kept from pi (deviations ledger #2/#3/#7/#8): LF pre-normalization with
+ * BOM/CRLF restoration, `withFileMutationQueue`, constrained sampling, and the
+ * argument-normalization shim that stands in for hermes' `schema_sanitizer.py`.
+ * Registered under a separate name so it runs alongside `edit`, never instead
+ * of it (ledger #1).
  */
 import { constants } from "node:fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import * as nodePath from "node:path";
 import { Type } from "typebox";
 import { withFileMutationQueue, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import {
-	buildLineIndex,
-	detectLineEnding,
-	lineAt,
-	normalizeToLF,
-	restoreLineEndings,
-	splitBom,
-	type LineIndex,
-} from "./text.js";
-import { runChain, type ChainFailure, type ChainMatch, type MatchLocation } from "./chain.js";
-import type { Span } from "./span-map.js";
-import { maybeUnescapeNewString, shapeReplacement, unicodeEditPlan } from "./shaping.js";
+import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from "./text.js";
+import { runChain, type ChainFailure, type StrategyName } from "./chain.js";
+import { applyReplacements, maybeUnescapeNewString, unicodeEditPlan } from "./shaping.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
 import {
 	alreadyAppliedMessage,
 	ambiguityErrorMessage,
-	emptyOldTextError,
+	emptyOldStringError,
 	escapeDriftErrorMessage,
-	identicalTextsError,
+	identicalStringsError,
+	missingPathError,
+	missingReplacementError,
+	multiEditRefusalError,
 	noMatchErrorMessage,
-	overlapErrorMessage,
+	patchModeUnavailableError,
 	replaceAllRefusalMessage,
+	unknownModeError,
+	whitespaceOnlyOldStringError,
 } from "./errors.js";
 
-const replaceEditSchema = Type.Object({
-	oldText: Type.String({
-		description:
-			"Text to find in the file. Must be unique in the original file and must not overlap with any other edits[].oldText in the same call. Matching tolerates minor whitespace, indentation, and margin differences, but copy the text from the current file content as closely as you can.",
-	}),
-	newText: Type.String({ description: "Replacement text for this targeted edit." }),
-	replaceAll: Type.Optional(
-		Type.Boolean({
+/**
+ * hermes `PATCH_SCHEMA` (base, replace-only). The V4A layer (`mode` + `patch`
+ * params, dual-mode description) is Tier 3; the handler still *accepts* those
+ * params from any model, the schema just doesn't advertise them — exactly
+ * hermes' posture. `replace_all` carries no `default` keyword: pi's
+ * constrained-sampling JSON schema is stricter than hermes' free-form dict, and
+ * the description states the default instead.
+ */
+const patchSchema = Type.Object(
+	{
+		path: Type.String({ description: "File path to edit." }),
+		old_string: Type.String({
 			description:
-				"Replace every non-overlapping occurrence of oldText instead of requiring a unique match. Only use when every occurrence should change. Refused when the match is only approximate (similarity strategies) — provide the precise text (whitespace included) instead.",
+				"Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
 		}),
-	),
-}, {});
-
-const patchSchema = Type.Object({
-	path: Type.String({ description: "Path to the file to edit (relative or absolute)" }),
-	edits: Type.Array(replaceEditSchema, {
-		description:
-			"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
-	}),
-}, {});
+		new_string: Type.String({
+			description: "Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text.",
+		}),
+		replace_all: Type.Optional(
+			Type.Boolean({
+				description: "Replace all occurrences instead of requiring a unique match (default: false)",
+			}),
+		),
+	},
+	{},
+);
 
 export type PatchToolInput = {
 	path: string;
-	edits: { oldText: string; newText: string; replaceAll?: boolean }[];
+	old_string: string;
+	new_string: string;
+	replace_all?: boolean;
+	/** hermes' dual-mode params — accepted from any model, honored in Tier 3 */
+	mode?: unknown;
+	patch?: unknown;
+	/** Retired transitional surface — kept in the type only so the handler can
+	 * recognize and refuse it (see `multiEditRefusalError`). */
+	edits?: unknown;
 };
+
+/** One validated replacement, in the tool's internal naming (the chain and the
+ * shaping helpers take `oldText`/`newText` positionally). */
+export interface Replacement {
+	oldString: string;
+	newString: string;
+	replaceAll: boolean;
+}
 
 export interface PatchToolDetails {
 	/** Display-oriented diff of the changes made */
@@ -79,92 +99,136 @@ export interface PatchToolDetails {
 const ALREADY_APPLIED_MIN_CHARS = 8;
 
 export const patchToolSystemPromptContribution = {
-	snippet: "Make precise file edits with whitespace-tolerant text replacement, including multiple disjoint edits in one call",
+	snippet: "Find a unique region of text in one file and replace it, with fuzzy (9-strategy) matching",
 	guidelines: [
-		"Use patch for precise changes; oldText is matched with whitespace/indentation tolerance and must be unique in the file",
-		"When changing multiple separate locations in one file, use one patch call with multiple entries in edits[] instead of multiple patch calls",
-		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-		"Set replaceAll on an edit only when every occurrence of oldText should change; approximate (similarity) matches refuse replaceAll — provide the precise text (whitespace included) instead.",
-		"If a patch fails, the error lists the closest matching sections — fix oldText from those sections instead of re-reading the whole file or retrying unchanged",
+		"Use patch for precise changes instead of sed/awk: old_string must be unique in the file, matching is whitespace/indentation tolerant",
+		"patch applies exactly one replacement per call (path + old_string + new_string); send one call per change",
+		"Copy old_string from the current file content; pass new_string as the changed text, or '' to delete the matched text",
+		"Set replace_all only when every occurrence should change; approximate (similarity) matches refuse replace_all — provide the precise text (whitespace included) instead",
+		"Keep old_string as small as possible while still unique. Do not pad with large unchanged regions.",
+		"If a patch fails, the error lists the closest matching sections — fix old_string from those sections instead of re-reading the whole file or retrying unchanged",
 	],
 };
 
-interface Edit {
-	oldText: string;
-	newText: string;
-	/** hermes replace_all: replace every occurrence of oldText (Tier 1 #2) */
-	replaceAll?: boolean;
-}
-
-function isSingleEditInput(value: unknown): value is Edit {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const edit = value as Record<string, unknown>;
-	return typeof edit.oldText === "string" && typeof edit.newText === "string";
-}
-
-/** hermes' schema spells it `replace_all`; models also send booleans as strings.
- * Accept both spellings and both value encodings (pi-style coercion, ledger #8). */
-function coerceReplaceAll(value: unknown): boolean | undefined {
+function coerceBoolean(value: unknown): boolean | undefined {
 	if (value === true || value === "true") return true;
 	if (value === false || value === "false") return false;
 	return undefined;
 }
 
-/** Normalize the per-edit flag: hermes' snake_case `replace_all` → `replaceAll`,
- * string booleans → booleans. Unrecognized values pass through untouched so
- * schema validation reports them loudly. */
-function normalizeEditEntries(edits: unknown): unknown {
-	if (!Array.isArray(edits)) return edits;
-	return edits.map((entry) => {
-		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
-		const e = entry as Record<string, unknown>;
-		const coerced = coerceReplaceAll(e.replaceAll ?? e.replace_all);
-		if (coerced === undefined && !("replace_all" in e)) return entry;
-		const { replace_all: _legacy, ...rest } = e;
-		return coerced === undefined ? rest : { ...rest, replaceAll: coerced };
-	});
+/** hermes' schema spells the params `old_string`/`new_string`/`replace_all`;
+ * models trained on pi's `edit` spell them `oldText`/`newText`/`replaceAll`
+ * (or camelCase, or send `edits[]`). Accept the drift, never invent a
+ * replacement: unrecognizable shapes are left for the handler to refuse. */
+const OLD_STRING_KEYS = ["old_string", "oldString", "old_text", "oldText"] as const;
+const NEW_STRING_KEYS = ["new_string", "newString", "new_text", "newText"] as const;
+const PATH_KEYS = ["path", "file_path", "filePath"] as const;
+
+function pickString(args: Record<string, unknown>, keys: readonly string[]): string | undefined {
+	for (const key of keys) {
+		const value = args[key];
+		if (typeof value === "string") return value;
+	}
+	return undefined;
+}
+
+/** `edits` as sent by a model: a real array, a JSON string, or a lone object. */
+function parseEdits(value: unknown): unknown[] | undefined {
+	if (Array.isArray(value)) return value;
+	if (typeof value === "string") {
+		try {
+			const parsed: unknown = JSON.parse(value);
+			if (Array.isArray(parsed)) return parsed;
+			if (parsed && typeof parsed === "object") return [parsed];
+		} catch {
+			// Leave as-is; the handler reports it.
+		}
+		return undefined;
+	}
+	if (value && typeof value === "object") return [value];
+	return undefined;
+}
+
+/** Coerce one flat record of replacement params to hermes' own spelling. */
+function normalizeReplacementKeys(args: Record<string, unknown>): Record<string, unknown> {
+	const out: Record<string, unknown> = { ...args };
+	const path = pickString(out, PATH_KEYS);
+	const oldString = pickString(out, OLD_STRING_KEYS);
+	const newString = pickString(out, NEW_STRING_KEYS);
+	for (const key of [...PATH_KEYS, ...OLD_STRING_KEYS, ...NEW_STRING_KEYS]) delete out[key];
+	if (path !== undefined) out.path = path;
+	if (oldString !== undefined) out.old_string = oldString;
+	if (newString !== undefined) out.new_string = newString;
+
+	const replaceAll = coerceBoolean(out.replace_all ?? out.replaceAll);
+	delete out.replaceAll;
+	if (replaceAll !== undefined) out.replace_all = replaceAll;
+	else delete out.replace_all; // junk value: treat as "not set" (mass overwrite needs an explicit true)
+
+	return out;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
- * Same argument normalization as pi's built-in edit tool: some models send
- * edits as a JSON string, a single edit object, or legacy flat oldText/newText.
+ * Argument normalization — pi's analog of hermes' `schema_sanitizer.py`
+ * coercion layer (ledger #8). Maps param-name drift onto hermes' flat schema,
+ * flattens a **single** `edits[]` entry, and leaves anything ambiguous (several
+ * `edits[]` entries) intact for `validateCall` to refuse rather than silently
+ * applying one of the requested replacements.
  */
-export function prepareEditArguments(input: unknown): PatchToolInput {
-	if (!input || typeof input !== "object") return input as PatchToolInput;
-	const args = { ...(input as Record<string, unknown>) };
-	if (typeof args.edits === "string") {
-		try {
-			const parsed: unknown = JSON.parse(args.edits);
-			if (Array.isArray(parsed)) {
-				args.edits = parsed;
-			} else if (isSingleEditInput(parsed)) {
-				args.edits = [parsed];
-			}
-		} catch {
-			// Leave as-is; validation will report it.
-		}
-	} else if (isSingleEditInput(args.edits)) {
-		args.edits = [args.edits];
-	}
-	if (typeof args.oldText === "string" && typeof args.newText === "string") {
-		const edits = Array.isArray(args.edits) ? [...(args.edits as unknown[])] : [];
-		// Legacy flat surface: a call-level flag rides along (hermes' own schema
-		// is flat — one replacement per call, replace_all next to the strings).
-		const flatAll = coerceReplaceAll(args.replaceAll ?? args.replace_all);
-		edits.push(
-			flatAll === undefined
-				? { oldText: args.oldText, newText: args.newText }
-				: { oldText: args.oldText, newText: args.newText, replaceAll: flatAll },
-		);
-		delete args.oldText;
-		delete args.newText;
-		delete args.replaceAll;
-		delete args.replace_all;
-		args.edits = edits;
-	}
-	args.edits = normalizeEditEntries(args.edits);
+export function preparePatchArguments(input: unknown): PatchToolInput {
+	if (!input || typeof input !== "object" || Array.isArray(input)) return input as PatchToolInput;
+	const raw: Record<string, unknown> = { ...(input as Record<string, unknown>) };
+	const edits = raw.edits === undefined ? undefined : parseEdits(raw.edits);
+	// A single edits[] entry (models trained on pi's `edit`) is the same call in
+	// a different shape: merge it up. Multi-entry arrays stay put so the handler
+	// can refuse instead of guessing which replacement was meant; unparseable
+	// junk is dropped so the ordinary missing-param error wins.
+	const single = edits?.length === 1 && isRecord(edits[0]) ? edits[0] : undefined;
+	const args = normalizeReplacementKeys(single ? { ...raw, ...single } : raw);
+	if (single) delete args.edits;
+	else if (raw.edits !== undefined && !edits) delete args.edits;
 	return args as unknown as PatchToolInput;
+}
+
+/** hermes' mode/arg gates (`patch_tool`'s if/elif chain), in hermes' order:
+ * the mode dispatch is exclusive, so an unknown `mode` answers before the
+ * replace-mode gates, and replace mode ignores a stray `patch` param. */
+function validateCall(input: PatchToolInput): { path: string; replacement: Replacement } {
+	const mode = typeof input.mode === "string" ? input.mode : undefined;
+	if (mode !== undefined && mode !== "replace" && mode !== "patch") throw new Error(unknownModeError(mode));
+	// A model that dropped `mode` but sent V4A-looking content is only steered at
+	// the missing mode when no complete replacement is in flight: hermes defaults
+	// to replace mode and ignores `patch` entirely, so a stray param must never
+	// refuse an edit hermes would land.
+	const completeReplacement =
+		typeof input.path === "string" && input.path.length > 0 && typeof input.old_string === "string" && typeof input.new_string === "string";
+	const v4aIntent =
+		mode === "patch" ||
+		(mode === undefined && !completeReplacement && typeof input.patch === "string" && input.patch.includes("***"));
+	// V4A lands in Tier 3; refuse instead of pretending to have applied it.
+	if (v4aIntent) throw new Error(patchModeUnavailableError());
+
+	const edits = parseEdits(input.edits);
+	if (edits && edits.length > 0) throw new Error(multiEditRefusalError(edits.length));
+
+	if (typeof input.path !== "string" || input.path.length === 0) throw new Error(missingPathError());
+	if (typeof input.old_string !== "string" || typeof input.new_string !== "string") {
+		throw new Error(missingReplacementError());
+	}
+	return {
+		path: input.path,
+		replacement: {
+			oldString: input.old_string,
+			newString: input.new_string,
+			// Conservative by design: only an explicit true (or "true", coerced
+			// upstream) may fan a replacement out over the whole file.
+			replaceAll: input.replace_all === true,
+		},
+	};
 }
 
 function resolveToCwd(filePath: string, cwd: string): string {
@@ -175,173 +239,72 @@ function resolveToCwd(filePath: string, cwd: string): string {
 	return nodePath.isAbsolute(filePath) ? nodePath.normalize(filePath) : nodePath.resolve(cwd, filePath);
 }
 
-function validateEdits(edits: Edit[]): void {
-	for (let i = 0; i < edits.length; i++) {
-		const edit = edits[i];
-		if (!edit || typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
-			throw new Error(`Edit #${i + 1} is invalid. edits[] entries need string oldText and newText.`);
-		}
-		if (edit.oldText.trim().length === 0) {
-			throw new Error(emptyOldTextError(i + 1));
-		}
-		if (edit.oldText === edit.newText) {
-			throw new Error(identicalTextsError(i + 1));
-		}
+/** hermes `is_already_applied`: new_string non-trivial (≥ 8 non-blank chars) and
+ * present EXACTLY, old_string gone. Conservative so it can never mask a real
+ * partial application. */
+function isAlreadyApplied(content: string, oldString: string, newString: string): boolean {
+	if (!newString || newString.trim().length < ALREADY_APPLIED_MIN_CHARS) return false;
+	if (!content.includes(newString)) return false;
+	return oldString === newString || !content.includes(oldString);
+}
+
+/** Chain failure → teaching error (hermes `_no_match_result` ordering: the
+ * already-applied check comes first, because the single most common production
+ * failure is a re-send of an edit that already landed). */
+function failureMessage(failure: ChainFailure, content: string, replacement: Replacement): string {
+	switch (failure.kind) {
+		case "ambiguous":
+			return ambiguityErrorMessage(failure.count, failure.locations);
+		case "escape_drift":
+			// Intentional block: no "did you mean" hint is layered on top.
+			return escapeDriftErrorMessage(failure.drift);
+		case "replace_all_similarity":
+			return replaceAllRefusalMessage(failure.count, failure.strategy);
+		case "no_match":
+			return noMatchErrorMessage(content, replacement.oldString);
 	}
 }
 
-function looksAlreadyApplied(edit: Edit, content: string): boolean {
-	const nonBlank = edit.newText.replace(/\s/g, "");
-	if (nonBlank.length < ALREADY_APPLIED_MIN_CHARS) return false;
-	return content.includes(edit.newText) && !content.includes(edit.oldText);
-}
-
-function spanLines(index: LineIndex, start: number, end: number): { startLine: number; endLine: number } {
-	return { startLine: lineAt(index, start), endLine: lineAt(index, Math.max(start, end - 1)) };
-}
-
-interface AppliedPatch {
-	newContent: string;
-	/** Total matched spans spliced (replaceAll occurrences included) */
-	replacements: number;
-}
+export type ReplacementOutcome =
+	| { ok: true; newContent: string; replacements: number; strategy: StrategyName }
+	/** `alreadyApplied` results are success-shaped: no write, no error. */
+	| { ok: false; alreadyApplied?: boolean; errorMessage: string };
 
 /**
- * Pure core shared by execute() and the TUI preview: validate, match every
- * edit against the same snapshot via the chain, check overlaps, splice with
- * replacement shaping. Returns the teaching error message on any failure.
+ * Pure core shared by execute() and the TUI preview: validate, run the chain,
+ * then shape and splice — hermes' `fuzzy_find_and_replace` and its
+ * orchestrator tail in one pass over LF-normalized content.
  */
-function applyPatchEdits(
-	normalizedContent: string,
-	edits: Edit[],
+export function applyReplacement(
+	content: string,
+	replacement: Replacement,
 	path: string,
-): { ok: true; result: AppliedPatch } | { ok: false; errorMessage: string } {
-	validateEdits(edits);
-	const index = buildLineIndex(normalizedContent);
+): ReplacementOutcome {
+	const { oldString, newString, replaceAll } = replacement;
+	// hermes' argument validation inside the orchestrator, before the chain.
+	if (!oldString) return { ok: false, errorMessage: emptyOldStringError() };
+	if (!oldString.trim()) return { ok: false, errorMessage: whitespaceOnlyOldStringError() };
+	if (oldString === newString) return { ok: false, errorMessage: identicalStringsError() };
 
-	const matches: (ChainMatch | null)[] = new Array(edits.length).fill(null);
-	const failures: { index: number; failure: ChainFailure }[] = [];
-	for (let i = 0; i < edits.length; i++) {
-		const result = runChain(normalizedContent, edits[i].oldText, {
-			replaceAll: edits[i].replaceAll === true,
-			// Arms the escape-drift guards on non-exact matches (Tier 1 #3)
-			newText: edits[i].newText,
-		});
-		if (result.ok) {
-			matches[i] = result.match;
-		} else {
-			failures.push({ index: i, failure: result.failure });
+	const result = runChain(content, oldString, { replaceAll, newText: newString });
+	if (!result.ok) {
+		if (isAlreadyApplied(content, oldString, newString)) {
+			return { ok: false, alreadyApplied: true, errorMessage: alreadyAppliedMessage(path) };
 		}
+		return { ok: false, errorMessage: failureMessage(result.failure, content, replacement) };
 	}
 
-	if (failures.length > 0) {
-		const ambiguous = failures.find((f) => f.failure.kind === "ambiguous");
-		const drifted = failures.find((f) => f.failure.kind === "escape_drift");
-		const appliedIndexes: number[] = [];
-		const missedIndexes: number[] = [];
-		for (const f of failures) {
-			if (f.failure.kind === "no_match" && looksAlreadyApplied(edits[f.index], normalizedContent)) {
-				appliedIndexes.push(f.index + 1);
-			} else if (f.failure.kind === "no_match") {
-				missedIndexes.push(f.index);
-			}
-		}
-		// Whole call already applied → success-shaped no-op (kills the #1 loop).
-		if (!ambiguous && missedIndexes.length === 0 && appliedIndexes.length === edits.length) {
-			return { ok: false, errorMessage: `__ALREADY_APPLIED__${alreadyAppliedMessage(path, appliedIndexes)}` };
-		}
-		const refusal = failures.find((f) => f.failure.kind === "replace_all_similarity");
-		let msg: string;
-		if (ambiguous) {
-			const failure = ambiguous.failure as Extract<ChainFailure, { kind: "ambiguous" }>;
-			msg = ambiguityErrorMessage(
-				path,
-				ambiguous.index + 1,
-				failure.strategy,
-				failure.count,
-				failure.locations as MatchLocation[],
-			);
-		} else if (drifted) {
-			// Drift is an intentional block (hermes: no match hint on top of it)
-			const failure = drifted.failure as Extract<ChainFailure, { kind: "escape_drift" }>;
-			msg = escapeDriftErrorMessage(path, drifted.index + 1, failure.drift);
-		} else if (refusal) {
-			const failure = refusal.failure as Extract<ChainFailure, { kind: "replace_all_similarity" }>;
-			msg = replaceAllRefusalMessage(path, refusal.index + 1, failure.strategy, failure.count);
-		} else {
-			const first = missedIndexes[0];
-			msg = noMatchErrorMessage(path, first + 1, normalizedContent, edits[first].oldText);
-		}
-		const others = failures.length - 1;
-		if (others > 0) {
-			// Failed to match OR was refused by a drift guard — either way it
-			// did not apply.
-			msg += `\n\n${others} other edit(s) in this call also failed to apply; nothing was written.`;
-		}
-		if (appliedIndexes.length > 0 && (ambiguous || missedIndexes.length > 0)) {
-			msg += `\n\nNote: edit ${appliedIndexes.map((i) => `#${i}`).join(", ")} appear${appliedIndexes.length === 1 ? "s" : ""} to be already applied — drop it from the call and re-send the rest.`;
-		}
-		return { ok: false, errorMessage: msg };
-	}
-
-	// Flatten every edit's matched spans — one per edit, or every occurrence of
-	// a replaceAll edit — matched against the same original content,
-	// all-or-nothing (pi semantics). Spans within one edit never overlap: the
-	// chain enforces str.replace's leftmost-greedy invariant (ledger #12).
-	const spans: { span: Span; editIndex: number; exact: boolean }[] = [];
-	for (let i = 0; i < matches.length; i++) {
-		const m = matches[i];
-		if (!m) continue;
-		for (const span of m.spans) spans.push({ span, editIndex: i, exact: m.exact });
-	}
-	const ordered = [...spans].sort((a, b) => a.span.start - b.span.start);
-	for (let k = 1; k < ordered.length; k++) {
-		const prev = ordered[k - 1];
-		const cur = ordered[k];
-		if (cur.span.start < prev.span.end) {
-			const a = { index: prev.editIndex + 1, ...spanLines(index, prev.span.start, prev.span.end) };
-			const b = { index: cur.editIndex + 1, ...spanLines(index, cur.span.start, cur.span.end) };
-			return { ok: false, errorMessage: overlapErrorMessage(path, a, b) };
-		}
-	}
-
-	// Per-edit shaping inputs (hermes orchestrator, Tier 1 #4): effective_new =
-	// conditional \t/\r unescape over THIS edit's matched regions (all
-	// strategies, exact included — issue #33733), plus the unicode opcode plan
-	// for unicode_normalized matches. Computed once per edit; each region is
-	// shaped in the splice (preserve-unicode -> reindent).
-	const shapedEdits = matches.map((m, i) => {
-		const edit = edits[i];
-		if (!m) return undefined;
-		const effectiveNew = maybeUnescapeNewString(edit.newText, normalizedContent, m.spans);
-		const unicodePlan =
-			m.strategy === "unicode_normalized" ? unicodeEditPlan(edit.oldText, effectiveNew) : undefined;
-		return { effectiveNew, unicodePlan };
+	// hermes orchestrator tail: effective_new = conditional \t/\r unescape over
+	// the matched regions (ALL strategies including exact — issue #33733), then
+	// _apply_replacements: unicode opcodes (unicode_normalized match) + reindent
+	// onto EACH region's depth, spliced end-to-start.
+	const { spans, strategy, exact } = result.match;
+	const effectiveNew = maybeUnescapeNewString(newString, content, spans);
+	const newContent = applyReplacements(content, spans, effectiveNew, {
+		oldText: exact ? undefined : oldString,
+		unicodePlan: strategy === "unicode_normalized" ? unicodeEditPlan(oldString, effectiveNew) : undefined,
 	});
-
-	// Splice in reverse order; shape non-exact replacements onto EACH region —
-	// occurrences of one replaceAll edit can sit at different depths and carry
-	// different typographic characters (unicode plan is per region).
-	const replacements = ordered
-		.slice()
-		.reverse()
-		.map(({ span, editIndex, exact }) => {
-			const edit = edits[editIndex];
-			const shaped = shapedEdits[editIndex]!;
-			const region = normalizedContent.slice(span.start, span.end);
-			const newText = exact
-				? shaped.effectiveNew
-				: shapeReplacement(region, shaped.effectiveNew, {
-						oldText: edit.oldText,
-						unicodePlan: shaped.unicodePlan,
-					});
-			return { start: span.start, end: span.end, newText };
-		});
-	let newContent = normalizedContent;
-	for (const r of replacements) {
-		newContent = newContent.slice(0, r.start) + r.newText + newContent.slice(r.end);
-	}
-	return { ok: true, result: { newContent, replacements: replacements.length } };
+	return { ok: true, newContent, replacements: spans.length, strategy };
 }
 
 const defaultEditOperations = {
@@ -350,23 +313,30 @@ const defaultEditOperations = {
 	access: (path: string) => fsAccess(path, constants.R_OK | constants.W_OK),
 };
 
-export function createPatchToolDefinition(cwd: string): ToolDefinition<typeof patchSchema, PatchToolDetails | undefined> {
+export function createPatchToolDefinition(
+	cwd: string,
+): ToolDefinition<typeof patchSchema, PatchToolDetails | undefined> {
 	const ops = defaultEditOperations;
 	return {
 		name: "patch",
 		label: "patch",
+		// hermes' base description verbatim, minus "Auto-runs syntax checks after
+		// editing." — pi exposes no lint harness, so promising it would be a lie
+		// (deviations ledger #5/#13).
 		description:
-			"Edit a single file by replacing a unique region of text. Matching tolerates minor whitespace, indentation, and escape drift, so small differences between oldText and the file will not break the edit — but always copy oldText from the current file content as closely as you can. Every edits[].oldText must match a unique, non-overlapping region; set replaceAll on an edit to replace every occurrence of oldText instead (refused when the match is only approximate). If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Failed matches return the closest matching sections so you can correct oldText without re-reading blindly.",
+			"Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. " +
+			"Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. " +
+			"Returns a unified diff. Finds a unique string and replaces it.",
 		promptSnippet: patchToolSystemPromptContribution.snippet,
 		promptGuidelines: [...patchToolSystemPromptContribution.guidelines],
 		parameters: patchSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
-		prepareArguments: prepareEditArguments,
+		prepareArguments: preparePatchArguments,
 		async execute(_toolCallId, input, signal, _onUpdate, ctx) {
-			const { path, edits } = input as PatchToolInput;
-			if (!Array.isArray(edits) || edits.length === 0) {
-				throw new Error("Patch tool input is invalid. edits must contain at least one replacement.");
-			}
+			// Re-run the (idempotent) normalization: pi's harness calls
+			// prepareArguments first, but SDK and preview callers may hand over raw
+			// model arguments, and the gates must not be skippable.
+			const { path, replacement } = validateCall(preparePatchArguments(input) as PatchToolInput);
 			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
 			return withFileMutationQueue(absolutePath, async () => {
 				const throwIfAborted = () => {
@@ -387,38 +357,36 @@ export function createPatchToolDefinition(cwd: string): ToolDefinition<typeof pa
 				throwIfAborted();
 
 				// Strip BOM and pre-normalize to LF before matching (pi's stronger
-				// approach — every strategy works on CRLF files; endings restored on write).
+				// approach — every strategy works on CRLF files; endings restored on
+				// write). hermes matches raw bytes and loses rungs 1/3/4/6 on CRLF.
 				const { bom, text: content } = splitBom(rawContent);
 				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
 
-				const applied = applyPatchEdits(normalizedContent, edits as Edit[], path);
+				const applied = applyReplacement(normalizedContent, replacement, path);
 				if (!applied.ok) {
-					const message = applied.errorMessage;
-					if (message.startsWith("__ALREADY_APPLIED__")) {
-						// Success-shaped no-op: do not write, do not error.
-						return {
-							content: [{ type: "text", text: message.slice("__ALREADY_APPLIED__".length) }],
-							details: undefined,
-						};
+					if (applied.alreadyApplied) {
+						// Success-shaped no-op: do not write, do not error — this is the
+						// single biggest small-model loop-breaker (analysis §4).
+						return { content: [{ type: "text", text: applied.errorMessage }], details: undefined };
 					}
-					throw new Error(message);
+					throw new Error(applied.errorMessage);
 				}
 				throwIfAborted();
 
-				const finalContent = bom + restoreLineEndings(applied.result.newContent, originalEnding);
+				const finalContent = bom + restoreLineEndings(applied.newContent, originalEnding);
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 
-				const diffResult = generateDiffString(normalizedContent, applied.result.newContent);
-				const patch = generateUnifiedPatch(path, normalizedContent, applied.result.newContent);
+				const diffResult = generateDiffString(normalizedContent, applied.newContent);
+				const patch = generateUnifiedPatch(path, normalizedContent, applied.newContent);
 				return {
 					content: [
 						{
 							type: "text",
 							// Model-facing diff (analysis §4: pi's diff never reaches the
 							// model — a free self-check loop for weak models).
-							text: `Successfully replaced ${applied.result.replacements} block(s) in ${path}.\n\n${patch}`,
+							text: `Successfully replaced ${applied.replacements} block(s) in ${path}.\n\n${patch}`,
 						},
 					],
 					details: {
@@ -433,32 +401,23 @@ export function createPatchToolDefinition(cwd: string): ToolDefinition<typeof pa
 }
 
 /**
- * Compute the diff a patch would produce without applying it.
- * Used for preview rendering in the TUI; runs the same chain as execute().
+ * Compute the diff a patch would produce without applying it — the TUI preview.
+ * Runs the same chain and shaping as execute(), so the preview can never
+ * diverge from what gets written.
  */
 export async function computePatchDiff(
 	path: string,
-	edits: Edit[],
+	replacement: Replacement,
 	cwd: string,
 ): Promise<{ diff: string; firstChangedLine?: number } | { error: string }> {
 	try {
-		if (!Array.isArray(edits) || edits.length === 0) {
-			return { error: "edits must contain at least one replacement." };
-		}
 		const absolutePath = resolveToCwd(path, cwd);
 		const raw = await fsReadFile(absolutePath, "utf-8");
 		const { text: content } = splitBom(raw);
 		const normalizedContent = normalizeToLF(content);
-		const applied = applyPatchEdits(normalizedContent, edits, path);
-		if (!applied.ok) {
-			const message = applied.errorMessage;
-			return {
-				error: message.startsWith("__ALREADY_APPLIED__")
-					? message.slice("__ALREADY_APPLIED__".length)
-					: message,
-			};
-		}
-		const diffResult = generateDiffString(normalizedContent, applied.result.newContent);
+		const applied = applyReplacement(normalizedContent, replacement, path);
+		if (!applied.ok) return { error: applied.errorMessage };
+		const diffResult = generateDiffString(normalizedContent, applied.newContent);
 		return { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine };
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };

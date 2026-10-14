@@ -31,12 +31,17 @@ deviations ledger #1). When working in this repo, treat **`patch` as your defaul
 file edits** and `edit` as the fallback:
 
 - **Reach for `edit` only when you must finish work that `patch` can't do** — e.g. a
-  limitation of the transitional `edits[]` surface, or a suspected tool bug. Switching is
+  limitation of the single-replacement surface (several hunks still cost several calls until
+  V4A lands), or a suspected tool bug. Switching is
   always allowed; never let a `patch` failure block the task.
 - **If `patch` fails or misbehaves — wrong match, wrong shaping, spurious ambiguity,
   unhelpful error, render glitch — log it** in [docs/DOGFOOD.md](docs/DOGFOOD.md): what you
   attempted, the error or wrong result verbatim, expected vs actual, and the strategy you
   expected to match. Then carry on with whatever tool completes the job.
+- **Diagnose before you log.** A miss is usually *your* context, not the engine: after a
+  session compaction, the file copy in your head may be a summary of what you meant to write,
+  not what is on disk — re-read the target (or trust the `file has: …` lines in the error)
+  before filing a `patch` bug.
 - **Fixed dogfood bugs become regression tests** in `test/patch.test.ts`, named after the
   failure mode (see Testing notes).
 
@@ -64,7 +69,7 @@ test).
 
 ```
 src/index.ts     extension entry — registers `patch` + TUI renderers
-src/tool.ts      tool definition (transitional edits[] surface) + chain + teaching errors
+src/tool.ts      tool definition (hermes' flat surface) + arg gates + shaping orchestrator
 src/chain.ts     ordered strategy chain (matches on LF-normalized content, returns spans)
 src/escape-drift.ts  escape-drift guards — port of hermes `_detect_escape_drift` (blocks
                  the write when args carry serialization artifacts the file lacks)
@@ -100,20 +105,25 @@ hermes or add a row to PLAN.md's deviations ledger.
 - **Uniqueness is per strategy**, counted in that strategy's space (this fixes pi's
   false-ambiguity regression where two regions differing only by smart quotes flag as
   ambiguous — and matches hermes). Don't "simplify" this into a single global uniqueness check.
-- **Tool surface is transitional**: `patch` currently exposes pi's `edits[]` multi-edit
-  schema (all-or-nothing against one snapshot, overlap detection). The exact-port target is
-  hermes' single-replacement surface — `old_string`/`new_string`/`replace_all`, one
-  replacement per call, multi-hunk/multi-file work moving to the V4A patch mode (PLAN.md
-  Tier 2 #5 / Tier 3). Until that reschema lands, keep the multi-edit semantics intact
-  and don't build new features that assume it. (`replace_all` itself already landed as
-  Tier 1 #2: a per-edit `replaceAll` flag — plus flat-form coercion — that maps 1:1 onto
-  hermes' flat flag and flattens back at the reschema; see ledger #12 for the
-  self-overlap guard hermes lacks.)
+- **Tool surface is hermes' single-replacement surface** (Tier 2 #5): `path` +
+  `old_string` + `new_string` + optional `replace_all`, **exactly one replacement per
+  call**, hermes' gates in hermes' order (`path required` →
+  `old_string and new_string required` → empty/whitespace-only/identical → `Unknown mode:`).
+  `new_string: ""` deletes the matched text. The transitional `edits[]` schema is retired:
+  `preparePatchArguments` (ledger #8) still flattens a *single-entry* `edits[]` and maps pi's
+  `oldText`/`newText`/`replaceAll`/`file_path` spellings onto hermes' names, but a multi-entry
+  call is refused with a teaching error rather than half-applied (ledger #14). Don't add
+  features that assume batching — multi-hunk/multi-file work belongs to V4A (Tier 3).
+  (`replace_all` landed as Tier 1 #2 with hermes' semantics: every match of the winning
+  strategy splices, similarity strategies refuse it; see ledger #12 for the self-overlap
+  guard hermes lacks.)
 - **V4A patch mode is in scope, not optional**: `patch` must grow `mode:"patch"` with
   hermes' schema layering (advertised to OpenAI-family models only, fail-closed; accepted
-  from any model) — analysis §2.1, PLAN.md Tier 3.
+  from any model) — analysis §2.1, PLAN.md Tier 3. The handler already *accepts* `mode`/
+  `patch` and answers with "not available in this build" (ledger #15); Tier 3 replaces that
+  answer with the parser, not with new acceptance code.
 - **Already-applied no-op is success-shaped** ("do not re-send this patch"), with a
-  conservative guard: `newText` ≥ 8 non-blank chars present exactly and `oldText` gone.
+  conservative guard: `new_string` ≥ 8 non-blank chars present exactly and `old_string` gone.
   Keep it conservative — it must never mask a real partial application.
 - **Errors teach**: no-match errors include did-you-mean sections with whitespace
   visualization (`file has: ····→code`); ambiguity errors list up to 5 `L<line>: snippet`

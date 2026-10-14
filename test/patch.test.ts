@@ -1,8 +1,9 @@
 /**
- * pi-patch test corpus — Tier 1 acceptance per docs/PLAN.md:
- * the strategy chain, per-strategy uniqueness counting, replacement shaping,
- * teaching errors, and the tool-level file behaviors (multi-edit, overlap,
- * CRLF/BOM, already-applied no-op, argument normalization).
+ * pi-patch test corpus — the acceptance bar in docs/PLAN.md: the strategy
+ * chain, per-strategy uniqueness counting, replacement shaping, teaching-error
+ * fidelity (hermes Appendix B texts), and the tool-level file behaviors of the
+ * single-replacement surface (path + old_string + new_string + replace_all):
+ * CRLF/BOM, already-applied no-op, argument normalization, hermes' arg gates.
  */
 import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
@@ -36,8 +37,20 @@ import {
 	unicodeEditPlan,
 } from "../src/shaping.js";
 import { detectEscapeDrift } from "../src/escape-drift.js";
-import { escapeDriftErrorMessage } from "../src/errors.js";
-import { createPatchToolDefinition, prepareEditArguments } from "../src/tool.js";
+import {
+	applyReplacement,
+	createPatchToolDefinition,
+	preparePatchArguments,
+} from "../src/tool.js";
+import {
+	emptyOldStringError,
+	escapeDriftErrorMessage,
+	findClosestLines,
+	formatNoMatchHint,
+	identicalStringsError,
+	visualizeWhitespace,
+	whitespaceOnlyOldStringError,
+} from "../src/errors.js";
 import { generateDiffString } from "../src/diff-utils.js";
 
 describe("chain: strategy selection", () => {
@@ -125,7 +138,7 @@ function fuzzyReplace(
 					? `Found ${r.failure.count} matches for old_string.`
 					: r.failure.kind === "escape_drift"
 						// hermes returns the raw drift text from the orchestrator
-						? escapeDriftErrorMessage("f", 1, r.failure.drift)
+						? escapeDriftErrorMessage(r.failure.drift)
 						: r.failure.kind === "replace_all_similarity"
 							? "replace_all only applies to exact matches"
 							: "Could not find a match for old_string in the file",
@@ -591,33 +604,44 @@ describe("escape-drift: guard units (hermes _detect_escape_drift)", () => {
 });
 
 describe("escape-drift: teaching texts (Appendix B)", () => {
-	// Byte-exact against the JSON-probed hermes messages, modulo the pi tool
-	// name (read_file → read), param names (old_string/new_string → the old/new
-	// text and our oldText/newText params), and the edit-#N-in-path context
-	// (ledger #10 + the transitional multi-edit surface).
+	// Byte-exact against the hermes messages: the only mapping left is the tool
+	// name the recovery hint points at (read_file → read, ledger #10) — the
+	// param names are hermes' own now that the surface is `old_string`/`new_string`.
 	it("quote-suspect message keeps hermes' repr formatting", () => {
-		const msg = escapeDriftErrorMessage("f.py", 1, { kind: "quote_suspect", suspect: "\\'", plain: "'" });
+		const msg = escapeDriftErrorMessage({ kind: "quote_suspect", suspect: "\\'", plain: "'" });
 		expect(msg).toBe(
-			String.raw`Escape-drift detected: the old and new text of edit #1 in f.py contain the literal sequence "\\'" but the matched region of the file does not. This is almost always a tool-call serialization artifact where an apostrophe or quote got prefixed with a spurious backslash. Re-read the file with read and pass oldText/newText without backslash-escaping "'" characters.`,
+			String.raw`Escape-drift detected: old_string and new_string contain the literal sequence "\\'" but the matched region of ` +
+				String.raw`the file does not. This is almost always a tool-call serialization artifact where an apostrophe or quote got ` +
+				String.raw`prefixed with a spurious backslash. Re-read the file with read and pass old_string/new_string without ` +
+				String.raw`backslash-escaping "'" characters.`,
 		);
-		const dquote = escapeDriftErrorMessage("f.py", 1, { kind: "quote_suspect", suspect: '\\"', plain: '"' });
+		const dquote = escapeDriftErrorMessage({ kind: "quote_suspect", suspect: '\\"', plain: '"' });
 		expect(dquote).toContain(String.raw`sequence '\\"'`);
 		expect(dquote).toContain(String.raw`escaping '"' characters.`);
 	});
 
 	it("newline-literal message keeps hermes' repr formatting", () => {
-		const msg = escapeDriftErrorMessage("f.py", 2, { kind: "newline_literal" });
+		const msg = escapeDriftErrorMessage({ kind: "newline_literal" });
 		expect(msg).toBe(
-			String.raw`Escape-drift detected: the old text of edit #2 in f.py contains more literal '\\n' sequences than the matched region of the file, which has real line breaks there instead. This is almost always a tool-call serialization artifact where a line break got escaped one extra time; the new text would write it as backslash + n. Re-read the file with read and pass oldText/newText with actual line breaks, keeping only the '\\n' sequences that appear literally in the file.`,
+			String.raw`Escape-drift detected: old_string contains more literal '\n' sequences than the matched region of the file, which ` +
+				String.raw`has real line breaks there instead. This is almost always a tool-call serialization artifact where a line break got escaped ` +
+				String.raw`one extra time; new_string would write it as backslash + n. Re-read the file with read and pass old_string/new_string ` +
+				String.raw`with actual line breaks, keeping only the '\n' sequences that appear literally in the file.`,
 		);
 	});
 
 	it("backslash-doubling message keeps hermes' backtick examples", () => {
-		const msg = escapeDriftErrorMessage("f.py", 1, { kind: "backslash_doubling" });
+		const bs = (n: number) => "\\".repeat(n);
+		const msg = escapeDriftErrorMessage({ kind: "backslash_doubling" });
 		expect(msg).toBe(
-			String.raw`Escape-drift detected: every backslash run in the old text of edit #1 in f.py is exactly twice as long as in the matched region of the file (e.g. the file has ` +
-				"`\\\\` where the old text has `\\\\\\\\`)." +
-				String.raw` The tool-call arguments were JSON-escaped one extra time; applying the new text verbatim would double every backslash in the file. Re-read the file with read and resend oldText/newText with the backslash counts exactly as they appear in the file.`,
+			"Escape-drift detected: every backslash run in old_string is exactly " +
+				"twice as long as in the matched region of the file (e.g. the file " +
+				// hermes backticks these examples instead of using repr
+				`has \`${bs(2)}\` where old_string has \`${bs(4)}\`). The tool-call arguments ` +
+				"were JSON-escaped one extra time; applying new_string verbatim would " +
+				"double every backslash in the file. Re-read the file with read " +
+				"and resend old_string/new_string with the backslash counts exactly " +
+				"as they appear in the file.",
 		);
 	});
 });
@@ -878,44 +902,100 @@ describe("diff-utils: display diff", () => {
 	});
 });
 
-describe("tool: prepareEditArguments", () => {
-	it("parses edits from a JSON string (model drift)", () => {
-		const out = prepareEditArguments({ path: "f", edits: '[{"oldText":"a","newText":"b"}]' });
-		expect(out.edits).toEqual([{ oldText: "a", newText: "b" }]);
+describe("tool: advertised schema is hermes' base PATCH_SCHEMA", () => {
+	const tool = createPatchToolDefinition("/tmp");
+	const params = tool.parameters as unknown as { properties: Record<string, unknown>; required?: string[] };
+
+	it("advertises path + old_string + new_string (+ optional replace_all) and nothing else", () => {
+		expect(Object.keys(params.properties).sort()).toEqual(["new_string", "old_string", "path", "replace_all"]);
+		expect([...(params.required ?? [])].sort()).toEqual(["new_string", "old_string", "path"]);
+		// the retired transitional surface must not come back through the schema
+		expect(params.properties).not.toHaveProperty("edits");
+		// hermes layers mode/patch only behind the OpenAI-family gate (Tier 3 #9): the
+		// base schema stays replace-only, and the handler still answers them (ledger #15)
+		expect(params.properties).not.toHaveProperty("mode");
+		expect(params.properties).not.toHaveProperty("patch");
 	});
 
-	it("wraps a single edit object into edits[]", () => {
-		const out = prepareEditArguments({ path: "f", edits: { oldText: "a", newText: "b" } });
-		expect(out.edits).toHaveLength(1);
+	it("keeps the tolerance promise the schema text makes", () => {
+		// AGENTS.md: the schema promises tolerance — the implementation must keep it
+		expect(tool.description).toContain("fuzzy matching (9 strategies)");
+		expect(tool.description).toContain("Returns a unified diff");
+		// hermes' base promise, minus the syntax-check line pi can't honor (ledger #13)
+		expect(tool.description).not.toContain("syntax");
+		expect((params.properties.old_string as { description: string }).description).toContain(
+			"Must be unique in the file unless replace_all=true",
+		);
+	});
+});
+
+describe("tool: preparePatchArguments (schema_sanitizer analog, ledger #8)", () => {
+	it("passes hermes' flat shape through untouched", () => {
+		expect(preparePatchArguments({ path: "f", old_string: "a", new_string: "b", replace_all: true })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+			replace_all: true,
+		});
 	});
 
-	it("accepts legacy flat oldText/newText", () => {
-		const out = prepareEditArguments({ path: "f", oldText: "a", newText: "b" });
-		expect(out.edits).toEqual([{ oldText: "a", newText: "b" }]);
+	it("maps pi's edit param names onto hermes'", () => {
+		expect(preparePatchArguments({ path: "f", oldText: "a", newText: "b" })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+		});
+		expect(preparePatchArguments({ file_path: "f", oldString: "a", newString: "b" })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+		});
 	});
 
-	it("folds a flat replace_all flag into the legacy flat edit", () => {
-		const snake = prepareEditArguments({ path: "f", oldText: "a", newText: "b", replace_all: true });
-		expect(snake.edits).toEqual([{ oldText: "a", newText: "b", replaceAll: true }]);
-		const camel = prepareEditArguments({ path: "f", oldText: "a", newText: "b", replaceAll: "true" });
-		expect(camel.edits).toEqual([{ oldText: "a", newText: "b", replaceAll: true }]);
+	it("flattens a single-entry edits[] (array, JSON string, or lone object)", () => {
+		expect(preparePatchArguments({ path: "f", edits: '[{"old_text":"a","new_text":"b","replace_all":"true"}]' })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+			replace_all: true,
+		});
+		expect(preparePatchArguments({ path: "f", edits: { old_string: "a", new_string: "b" } })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+		});
 	});
 
-	it("normalizes per-edit replace_all (snake_case and string booleans)", () => {
-		const out = prepareEditArguments({
+	it("leaves a multi-entry edits[] intact for the handler to refuse", () => {
+		const out = preparePatchArguments({
 			path: "f",
 			edits: [
-				{ oldText: "a", newText: "b", replace_all: "false" },
-				{ oldText: "c", newText: "d" },
+				{ old_string: "a", new_string: "b" },
+				{ old_string: "c", new_string: "d" },
 			],
 		});
-		expect(out.edits).toEqual([
-			{ oldText: "a", newText: "b", replaceAll: false },
-			{ oldText: "c", newText: "d" },
-		]);
-		// unrecognized values pass through untouched — schema validation reports them
-		const junk = prepareEditArguments({ path: "f", edits: [{ oldText: "a", newText: "b", replaceAll: 5 }] });
-		expect(junk.edits).toEqual([{ oldText: "a", newText: "b", replaceAll: 5 }]);
+		expect(out.old_string).toBeUndefined();
+		expect(Array.isArray(out.edits) && out.edits).toHaveLength(2);
+	});
+
+	it("coerces string booleans and drops junk flag values", () => {
+		// a mass overwrite needs an explicit true — a junk value must not enable it
+		expect(preparePatchArguments({ path: "f", old_string: "a", new_string: "b", replaceAll: "true" })).toMatchObject({
+			replace_all: true,
+		});
+		expect(preparePatchArguments({ path: "f", old_string: "a", new_string: "b", replace_all: 5 })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+		});
+	});
+
+	it("drops unparseable edits junk so the ordinary missing-param error wins", () => {
+		expect(preparePatchArguments({ path: "f", old_string: "a", new_string: "b", edits: "not json" })).toEqual({
+			path: "f",
+			old_string: "a",
+			new_string: "b",
+		});
 	});
 });
 
@@ -929,16 +1009,16 @@ describe("tool: execute against real files", () => {
 
 	const tool = createPatchToolDefinition("/tmp");
 
+	// Raw tool-call arguments, as the model sent them: execute() re-runs the
+	// (idempotent) argument normalization itself, so both the harness path and a
+	// direct SDK call see the same gates.
 	async function run(input: object, cwd: string) {
 		return tool.execute("test-call", input as never, undefined, undefined, { cwd } as never);
 	}
 
-	it("applies an edit with indent shaping and returns a model-facing diff", async () => {
+	it("applies one replacement with indent shaping and returns a model-facing diff", async () => {
 		const { dir, file, name } = await tmpFile("function f() {\n\treturn 1;\n}\n");
-		const res = await run(
-			{ path: name, edits: [{ oldText: "  return 1;", newText: "  return 42;" }] },
-			dir,
-		);
+		const res = await run({ path: name, old_string: "  return 1;", new_string: "  return 42;" }, dir);
 		const after = await fs.readFile(file, "utf-8");
 		expect(after).toBe("function f() {\n\treturn 42;\n}\n");
 		const text = res.content.map((c) => (c as { text: string }).text).join("");
@@ -947,127 +1027,93 @@ describe("tool: execute against real files", () => {
 		expect(res.details?.firstChangedLine).toBe(2);
 	});
 
+	it("accepts a pi-shaped call (edits[] with one entry, camelCase names)", async () => {
+		const { dir, file, name } = await tmpFile("a\nb\n");
+		const res = await run({ path: name, edits: [{ oldText: "a", newText: "A" }] }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("A\nb\n");
+		expect(res.content.map((c) => (c as { text: string }).text).join("")).toContain("Successfully replaced 1");
+	});
+
+	it("refuses a multi-replacement edits[] call without writing", async () => {
+		// one replacement per call is the hermes surface (Tier 2 #5); silently
+		// applying the first entry would report work that never happened
+		const { dir, file, name } = await tmpFile("a\nb\nc\nd\n");
+		await expect(
+			run(
+				{
+					path: name,
+					edits: [
+						{ oldText: "a", newText: "A" },
+						{ oldText: "d", newText: "D" },
+					],
+				},
+				dir,
+			),
+		).rejects.toThrow(/no edits\[\] parameter[\s\S]*exactly one replacement per call/);
+		expect(await fs.readFile(file, "utf-8")).toBe("a\nb\nc\nd\n");
+	});
+
+	it("deletes the matched text when new_string is empty (schema promise)", async () => {
+		const { dir, file, name } = await tmpFile("keep\ndrop me\nkeep\n");
+		await run({ path: name, old_string: "drop me\n", new_string: "" }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("keep\nkeep\n");
+	});
+
 	it("unicode_normalized edit keeps the file's typographic characters on disk", async () => {
 		const { dir, file, name } = await tmpFile("Wait for it\u2026and done\n");
-		await run(
-			{ path: name, edits: [{ oldText: "Wait for it...and done", newText: "Wait for it...then done" }] },
-			dir,
-		);
+		await run({ path: name, old_string: "Wait for it...and done", new_string: "Wait for it...then done" }, dir);
 		expect(await fs.readFile(file, "utf-8")).toBe("Wait for it\u2026then done\n");
 	});
 
-	it("exact edit unescapes literal \\t in newText when the file has real tabs (issue #33733)", async () => {
+	it("exact edit unescapes literal \\t in new_string when the file has real tabs (issue #33733)", async () => {
 		const { dir, file, name } = await tmpFile("def hello():\n\tprint(\"before\")\n");
-		await run(
-			{ path: name, edits: [{ oldText: "\tprint(\"before\")", newText: "\\tprint(\"after\")" }] },
-			dir,
-		);
+		await run({ path: name, old_string: "\tprint(\"before\")", new_string: "\\tprint(\"after\")" }, dir);
 		const after = await fs.readFile(file, "utf-8");
 		expect(after).toBe("def hello():\n\tprint(\"after\")\n");
 		expect(after).not.toContain("\\t");
 	});
 
-	it("applies multiple disjoint edits all-or-nothing against the same snapshot", async () => {
-		const { dir, file, name } = await tmpFile("a\nb\nc\nd\n");
-		const res = await run(
-			{ path: name, edits: [{ oldText: "a", newText: "A" }, { oldText: "d", newText: "D" }] },
-			dir,
-		);
-		expect(await fs.readFile(file, "utf-8")).toBe("A\nb\nc\nD\n");
-		expect(res.details?.diff).toContain("+1 A");
-		expect(res.details?.diff).toContain("+4 D");
-	});
-
-	it("replaceAll replaces every occurrence in one edit", async () => {
+	it("replace_all replaces every occurrence in one call", async () => {
 		const { dir, file, name } = await tmpFile("aaa bbb aaa\n");
-		const res = await run(
-			{ path: name, edits: [{ oldText: "aaa", newText: "ccc", replaceAll: true }] },
-			dir,
-		);
+		const res = await run({ path: name, old_string: "aaa", new_string: "ccc", replace_all: true }, dir);
 		expect(await fs.readFile(file, "utf-8")).toBe("ccc bbb ccc\n");
-		const text = res.content.map((c) => (c as { text: string }).text).join("");
-		expect(text).toContain("Successfully replaced 2 block(s)");
+		expect(res.content.map((c) => (c as { text: string }).text).join("")).toContain("Successfully replaced 2 block(s)");
 	});
 
-	it("mixed call: replaceAll edit + unique edit, both applied all-or-nothing", async () => {
-		const { dir, file, name } = await tmpFile("aaa bbb aaa\nccc\n");
-		const res = await run(
-			{
-				path: name,
-				edits: [
-					{ oldText: "aaa", newText: "X", replaceAll: true },
-					{ oldText: "ccc", newText: "Y" },
-				],
-			},
-			dir,
-		);
-		expect(await fs.readFile(file, "utf-8")).toBe("X bbb X\nY\n");
-		const text = res.content.map((c) => (c as { text: string }).text).join("");
-		expect(text).toContain("Successfully replaced 3 block(s)");
+	it("replace_all arrives as a string boolean and still means all", async () => {
+		const { dir, file, name } = await tmpFile("aaa bbb aaa\n");
+		await run({ path: name, old_string: "aaa", new_string: "ccc", replace_all: "true" }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("ccc bbb ccc\n");
 	});
 
-	it("replaceAll re-indents onto EACH occurrence's depth", async () => {
+	it("replace_all re-indents onto EACH occurrence's depth", async () => {
 		const { dir, file, name } = await tmpFile("    alpha\n    beta\n        alpha\n        beta\n");
-		await run(
-			{ path: name, edits: [{ oldText: "alpha\nbeta", newText: "gamma\ndelta", replaceAll: true }] },
-			dir,
-		);
+		await run({ path: name, old_string: "alpha\nbeta", new_string: "gamma\ndelta", replace_all: true }, dir);
 		expect(await fs.readFile(file, "utf-8")).toBe("    gamma\n    delta\n        gamma\n        delta\n");
 	});
 
 	it("refuses replace_all over approximate (similarity) matches without writing", async () => {
 		const { dir, file, name } = await tmpFile("start\nmid1\nend\nstart\nmid2\nend\n");
 		await expect(
-			run(
-				{ path: name, edits: [{ oldText: "start\nmid\nend", newText: "QQ", replaceAll: true }] },
-				dir,
-			),
-		).rejects.toThrow(/replaceAll only applies to exact matches/);
+			run({ path: name, old_string: "start\nmid\nend", new_string: "QQ", replace_all: true }, dir),
+		).rejects.toThrow(/replace_all only applies to exact matches/);
 		expect(await fs.readFile(file, "utf-8")).toBe("start\nmid1\nend\nstart\nmid2\nend\n");
-	});
-
-	it("already-applied no-op still wins for a replaceAll edit", async () => {
-		const { dir, file, name } = await tmpFile("value = 42\n");
-		const res = await run(
-			{ path: name, edits: [{ oldText: "zzz = 41", newText: "value = 42", replaceAll: true }] },
-			dir,
-		);
-		const text = res.content.map((c) => (c as { text: string }).text).join("");
-		expect(text).toMatch(/already applied/);
-		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
-	});
-
-	it("rejects overlapping edits without writing", async () => {
-		const { dir, file, name } = await tmpFile("keep\nchange me please\nkeep\n");
-		await expect(
-			run(
-				{
-					path: name,
-					edits: [
-						{ oldText: "change me", newText: "x" },
-						{ oldText: "me please", newText: "y" },
-					],
-				},
-				dir,
-			),
-		).rejects.toThrow(/overlapping/i);
-		expect(await fs.readFile(file, "utf-8")).toBe("keep\nchange me please\nkeep\n");
-	});
-
-	it("preserves CRLF line endings and BOM", async () => {
-		const { dir, file, name } = await tmpFile("\uFEFFone\r\ntwo\r\n");
-		await run({ path: name, edits: [{ oldText: "two", newText: "TWO" }] }, dir);
-		const raw = await fs.readFile(file, "utf-8");
-		expect(raw).toBe("\uFEFFone\r\nTWO\r\n");
 	});
 
 	it("returns a success-shaped no-op for an already-applied edit", async () => {
 		const { dir, file, name } = await tmpFile("value = 42\n");
-		// oldText must be unmatchable by the FULL chain: context_aware matches
+		// old_string must be unmatchable by the FULL chain: context_aware matches
 		// near-misses at >=0.80 similarity, and "value = 41" vs "value = 42" is 0.9.
-		const res = await run({ path: name, edits: [{ oldText: "zzz = 41", newText: "value = 42" }] }, dir);
+		const res = await run({ path: name, old_string: "zzz = 41", new_string: "value = 42" }, dir);
 		const text = res.content.map((c) => (c as { text: string }).text).join("");
-		expect(text).toMatch(/already applied/);
+		expect(text).toContain("already applied");
+		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
+	});
+
+	it("already-applied no-op still wins for a replace_all edit", async () => {
+		const { dir, file, name } = await tmpFile("value = 42\n");
+		const res = await run({ path: name, old_string: "zzz = 41", new_string: "value = 42", replace_all: true }, dir);
+		expect(res.content.map((c) => (c as { text: string }).text).join("")).toContain("already applied");
 		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
 	});
 
@@ -1075,37 +1121,31 @@ describe("tool: execute against real files", () => {
 		// hermes applies this edit too: the chain runs BEFORE already-applied
 		// detection (_no_match_result only sees genuine no-matches).
 		const { dir, file, name } = await tmpFile("value = 42\n");
-		const res = await run({ path: name, edits: [{ oldText: "value = 41", newText: "value = 42" }] }, dir);
-		const text = res.content.map((c) => (c as { text: string }).text).join("");
-		expect(text).toMatch(/Successfully replaced/);
+		const res = await run({ path: name, old_string: "value = 41", new_string: "value = 42" }, dir);
+		expect(res.content.map((c) => (c as { text: string }).text).join("")).toContain("Successfully replaced");
 		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
 	});
 
 	it("ambiguity errors name the match locations", async () => {
 		const { dir, name } = await tmpFile("dup\nmid\ndup\n");
-		await expect(
-			run({ path: name, edits: [{ oldText: "dup", newText: "x" }] }, dir),
-		).rejects.toThrow(/Found 2 matches[\s\S]*L1[\s\S]*L3/);
+		await expect(run({ path: name, old_string: "dup", new_string: "x" }, dir)).rejects.toThrow(
+			/Found 2 matches for old_string[\s\S]*L1: dup[\s\S]*L3: dup/,
+		);
 	});
 
 	it("no-match errors carry the did-you-mean sections", async () => {
-		// "function comput() {...}" is 0.974 similar to the file's first line —
-		// context_aware matches it (hermes parity). Use a first line below the
-		// 0.80 bar ("def comput..." is 0.706) but above the 0.30 suggestion floor.
+		// "def comput() {...}" is 0.706 similar to the file's first line — below
+		// context_aware's 0.80 bar, above the 0.30 suggestion floor.
 		const { dir, name } = await tmpFile("function compute() {\n\treturn 7;\n}\n");
 		await expect(
-			run({ path: name, edits: [{ oldText: "def comput() {\n\treturn 7;\n}", newText: "x" }] }, dir),
+			run({ path: name, old_string: "def comput() {\n\treturn 7;\n}", new_string: "x" }, dir),
 		).rejects.toThrow(/Did you mean one of these sections\?/);
 	});
 
-	it("identical old/new and empty old are rejected with recovery text", async () => {
-		const { dir, name } = await tmpFile("abc\n");
-		await expect(
-			run({ path: name, edits: [{ oldText: "abc", newText: "abc" }] }, dir),
-		).rejects.toThrow(/identical/);
-		await expect(
-			run({ path: name, edits: [{ oldText: "   ", newText: "x" }] }, dir),
-		).rejects.toThrow(/whitespace-only|empty/);
+	it("preserves CRLF line endings and BOM", async () => {
+		const { dir, file, name } = await tmpFile("\uFEFFone\r\ntwo\r\n");
+		await run({ path: name, old_string: "two", new_string: "TWO" }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("\uFEFFone\r\nTWO\r\n");
 	});
 
 	it("escape-drift errors block the write and teach the fix", async () => {
@@ -1116,12 +1156,8 @@ describe("tool: execute against real files", () => {
 			run(
 				{
 					path: name,
-					edits: [
-						{
-							oldText: 'def greet():\\n    print("hi")',
-							newText: 'def greet():\\n    print("hello")',
-						},
-					],
+					old_string: 'def greet():\\n    print("hi")',
+					new_string: 'def greet():\\n    print("hello")',
 				},
 				dir,
 			),
@@ -1129,26 +1165,179 @@ describe("tool: execute against real files", () => {
 		expect(await fs.readFile(file, "utf-8")).toBe('def greet():\n    print("hi")\n');
 	});
 
-	it("mixed call: drift refusal names its edit and reports the other failure", async () => {
-		const { dir, file, name } = await tmpFile('def greet():\n    print("hi")\n');
-		await expect(
-			run(
-				{
-					path: name,
-					edits: [
-						{
-							oldText: 'def greet():\\n    print("hi")',
-							newText: 'def greet():\\n    print("hello")',
-						},
-						{ oldText: "totally absent text", newText: "x" },
-					],
-				},
-				dir,
-			),
-		).rejects.toThrow(
-			/Escape-drift detected[\s\S]*edit #1[\s\S]*other edit\(s\) in this call also failed to apply/,
+	it("runs hermes' argument gates before touching the file", async () => {
+		const { dir, name } = await tmpFile("abc\n");
+		await expect(run({ old_string: "abc", new_string: "x" }, dir)).rejects.toThrow(/^path required$/);
+		await expect(run({ path: name }, dir)).rejects.toThrow(/^old_string and new_string required$/);
+		await expect(run({ path: name, old_string: "", new_string: "x" }, dir)).rejects.toThrow(
+			/^old_string is empty — nothing to match/,
 		);
-		expect(await fs.readFile(file, "utf-8")).toBe('def greet():\n    print("hi")\n');
+		await expect(run({ path: name, old_string: "   ", new_string: "x" }, dir)).rejects.toThrow(
+			/^old_string is only whitespace/,
+		);
+		await expect(run({ path: name, old_string: "abc", new_string: "abc" }, dir)).rejects.toThrow(
+			/^No edit was applied because old_string and new_string are identical/,
+		);
+	});
+
+	it("answers an unadvertised mode instead of silently editing", async () => {
+		// V4A is Tier 3; the base schema doesn't advertise `mode`, but hermes'
+		// handler still accepts it from any model — and must never pretend to have
+		// applied a patch it cannot parse.
+		const { dir, file, name } = await tmpFile("abc\n");
+		await expect(run({ path: name, mode: "patch", patch: "*** Begin Patch\n*** End Patch" }, dir)).rejects.toThrow(
+			/mode='patch' \(V4A multi-file patch\) is not available/,
+		);
+		await expect(run({ path: name, mode: "sideways", old_string: "abc", new_string: "x" }, dir)).rejects.toThrow(
+			/^Unknown mode: sideways$/,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe("abc\n");
+		// hermes answers mode='patch' with no content as "patch content required";
+		// pre-Tier 3 both shapes get the same "not available" answer (ledger #15)
+		await expect(run({ path: name, mode: "patch" }, dir)).rejects.toThrow(/mode='patch' \(V4A multi-file patch\) is not available/);
+	});
+
+	it("ignores a stray patch param on a complete replace call, like hermes", async () => {
+		// hermes defaults to mode="replace" and never looks at `patch` there, so a
+		// model that leaks the param must not turn a landable edit into a refusal
+		const { dir, file, name } = await tmpFile("abc\n");
+		await run({ path: name, old_string: "abc", new_string: "xyz", patch: "*** Begin Patch\n*** End Patch" }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("xyz\n");
+	});
+});
+
+describe("errors: hermes Appendix B fidelity (single-replacement surface)", () => {
+	// The param names are hermes' own, so these are byte-exact against
+	// fuzzy_match.py / file_operations.py — only the recovery tool names are
+	// mapped to pi (ledger #10).
+	it("empty and whitespace-only old_string carry hermes' recovery texts", () => {
+		expect(emptyOldStringError()).toBe(
+			"old_string is empty — nothing to match. Set old_string to the exact existing text the replacement should " +
+				"replace (read the file first if unsure). To create a new file or fully rewrite one, use write instead. " +
+				"Do not re-send this call unchanged.",
+		);
+		expect(whitespaceOnlyOldStringError()).toBe(
+			"old_string is only whitespace — provide non-blank text to match. Set it to the exact existing text the " +
+				"replacement should replace (read the file first if unsure). Do not re-send this call unchanged.",
+		);
+		expect(identicalStringsError()).toBe(
+			"No edit was applied because old_string and new_string are identical. Provide the existing text to replace " +
+				"in old_string and the changed replacement text in new_string.",
+		);
+	});
+
+	it("ambiguity names up to 5 locations and counts the rest", () => {
+		const r = applyReplacement("dup\n".repeat(7), { oldString: "dup", newString: "x", replaceAll: false }, "f.py");
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.errorMessage).toBe(
+				"Found 7 matches for old_string. Provide more context to make it unique, or use replace_all=True. Matches:\n" +
+					["  L1: dup", "  L2: dup", "  L3: dup", "  L4: dup", "  L5: dup", "  ... and 2 more"].join("\n"),
+			);
+		}
+	});
+
+	it("replace_all refusal is hermes' text", () => {
+		const r = applyReplacement(
+			"start\nmid1\nend\nstart\nmid2\nend",
+			{ oldString: "start\nmid\nend", newString: "QQ", replaceAll: true },
+			"f.py",
+		);
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.errorMessage).toBe(
+				"Found 2 approximate matches via the 'block_anchor' strategy; replace_all only applies to exact " +
+					"matches. Provide the precise text (whitespace included) so an exact/line-trimmed match can be made.",
+			);
+		}
+	});
+
+	it("already-applied no-op is hermes' text and stays success-shaped", () => {
+		const r = applyReplacement("value = 42\n", { oldString: "zzz = 41", newString: "value = 42", replaceAll: false }, "f.py");
+		expect(r).toEqual({
+			ok: false,
+			alreadyApplied: true,
+			errorMessage:
+				"File already contains the target text — the edit appears to be already applied to f.py. " +
+				"No write performed; do not re-send this patch.",
+		});
+	});
+
+	it("no-match error is hermes' base text plus the did-you-mean hint", () => {
+		// "def qux():" is 0.70 from old_string — under context_aware's 0.80 bar,
+		// over the 0.30 suggestion floor ("def bar():" would have matched at 0.90).
+		const r = applyReplacement(
+			"def qux():\n    pass\ndef zork():\n    pass\n",
+			{ oldString: "def baz():", newString: "x", replaceAll: false },
+			"f.py",
+		);
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(
+				r.errorMessage.startsWith(
+					"Could not find a match for old_string in the file\n\nDid you mean one of these sections?\n",
+				),
+			).toBe(true);
+			expect(r.errorMessage).toContain("def qux():");
+			// hermes renders 4-wide right-aligned line numbers ("   1| …")
+			expect(r.errorMessage).toMatch(/^ {3}1\| def qux\(\):/m);
+		}
+	});
+});
+
+describe("diagnostics: find_closest_lines + format_no_match_hint (hermes corpora)", () => {
+	it("finds the most similar line (TestFindClosestLines)", () => {
+		const hint = findClosestLines("def baz():", "def foo():\n    pass\ndef bar():\n    return 1\n");
+		expect(hint.includes("def foo") || hint.includes("def bar")).toBe(true);
+	});
+
+	it("whitespace-shaped miss shows both lines (TestWhitespaceDiagnosis)", () => {
+		// File uses tabs; the model sends 4 spaces AND a wrong second line so every
+		// fuzzy strategy misses, but line 1 is a whitespace-only difference.
+		const content = "def f():\n\tvalue = compute_thing()\n\treturn value\n";
+		const hint = findClosestLines("    value = compute_thing()\n    return wrong_name", content);
+		expect(hint).toContain("Whitespace difference detected");
+		expect(hint).toContain("→value = compute_thing()");
+		expect(hint).toContain("····value = compute_thing()");
+	});
+
+	it("content miss carries no whitespace block", () => {
+		expect(findClosestLines("alpha = 999", "alpha = 1\nbeta = 2\n")).not.toContain("Whitespace difference detected");
+	});
+
+	it("exact line present needs no whitespace diagnosis", () => {
+		expect(findClosestLines("  x = 1\n  z = 3", "  x = 1\n  y = 2\n")).not.toContain("Whitespace difference detected");
+	});
+
+	it("visualizeWhitespace renders only the leading run (hermes _visualize_whitespace)", () => {
+		expect(visualizeWhitespace("\t x = a b")).toBe("→·x = a b");
+	});
+
+	it("no-match error end to end carries the whitespace diagnosis (TestEndToEndHint)", () => {
+		const content = "class A:\n\tdef run(self):\n\t\tstart_engine()\n\t\treturn 1\n";
+		const r = applyReplacement(content, {
+			oldString: "    def run(self):\n        boot_engine_wrong()\n        return 2",
+			newString: "    def run(self):\n        start_engine()\n        return 3",
+			replaceAll: false,
+		}, "a.py");
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.errorMessage).toContain("Did you mean");
+			expect(r.errorMessage).toContain("Whitespace difference detected");
+		}
+	});
+
+	it("the hint only rides on plain no-match errors (TestFormatNoMatchHint)", () => {
+		const content = "def foo():\n    pass\n";
+		expect(formatNoMatchHint("Could not find a match for old_string in the file", 0, "def baz():", content)).toContain(
+			"Did you mean",
+		);
+		// ambiguous / escape-drift / identical failures already explain themselves
+		expect(formatNoMatchHint("Found 2 matches for old_string.", 0, "def baz():", content)).toBe("");
+		expect(formatNoMatchHint("Escape-drift detected: old_string contains more literal '\\n' …", 0, "def baz():", content)).toBe("");
+		expect(formatNoMatchHint(identicalStringsError(), 0, "def baz():", content)).toBe("");
+		// and never on a result that actually matched
+		expect(formatNoMatchHint("Could not find a match for old_string in the file", 1, "def baz():", content)).toBe("");
 	});
 });
 

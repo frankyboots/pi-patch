@@ -11,7 +11,7 @@
  */
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { computePatchDiff } from "./tool.js";
+import { computePatchDiff, preparePatchArguments, type Replacement } from "./tool.js";
 
 type PatchPreview = { diff: string; firstChangedLine?: number } | { error: string };
 
@@ -37,44 +37,28 @@ interface RenderContext {
 	invalidate: () => void;
 }
 
-interface PatchToolRenderArgs {
-	path?: unknown;
-	edits?: unknown;
-	oldText?: unknown;
-	newText?: unknown;
-}
+/** Streaming tool-call arguments — any spelling the model chose; the same
+ * normalization the handler runs is applied before previewing. */
+type PatchToolRenderArgs = Record<string, unknown>;
 
+/**
+ * The preview must run the SAME normalized call as execute(), so it goes
+ * through the tool's own argument normalization instead of re-implementing the
+ * param-name tolerance here (a preview that disagrees with the write is the bug
+ * this renderer exists to avoid — analysis §7 ⚠).
+ */
 function getRenderablePreviewInput(
 	args: PatchToolRenderArgs | undefined,
-): { path: string; edits: { oldText: string; newText: string; replaceAll?: boolean }[] } | null {
+): { path: string; replacement: Replacement } | null {
 	if (!args || typeof args.path !== "string") return null;
-	const path = args.path;
-	if (
-		Array.isArray(args.edits) &&
-		args.edits.length > 0 &&
-		args.edits.every((edit) => {
-			const e = edit as Record<string, unknown> | null;
-			return !!e && typeof e.oldText === "string" && typeof e.newText === "string";
-		})
-	) {
-		return { path, edits: args.edits as { oldText: string; newText: string }[] };
-	}
-	if (typeof args.oldText === "string" && typeof args.newText === "string") {
-		// Keep the flat-form flag so the preview matches what execute() will do
-		// (same coercion as prepareEditArguments: snake_case + string booleans).
-		const raw = args as Record<string, unknown>;
-		const replaceAll =
-			raw.replace_all === true || raw.replace_all === "true" || raw.replaceAll === true || raw.replaceAll === "true";
-		return {
-			path,
-			edits: [
-				replaceAll
-					? { oldText: args.oldText, newText: args.newText, replaceAll: true }
-					: { oldText: args.oldText, newText: args.newText },
-			],
-		};
-	}
-	return null;
+	const call = preparePatchArguments(args) as Record<string, unknown>;
+	const oldString = call.old_string;
+	const newString = call.new_string;
+	if (typeof oldString !== "string" || typeof newString !== "string") return null;
+	return {
+		path: args.path,
+		replacement: { oldString, newString, replaceAll: call.replace_all === true },
+	};
 }
 
 function getCallComponent(state: PatchRenderState, lastComponent: unknown): PatchCallRenderComponent {
@@ -164,7 +148,7 @@ export const patchRenderers = {
 		const component = getCallComponent(context.state, context.lastComponent);
 		const previewInput = getRenderablePreviewInput(args);
 		const argsKey = previewInput
-			? JSON.stringify({ path: previewInput.path, edits: previewInput.edits })
+			? JSON.stringify({ path: previewInput.path, replacement: previewInput.replacement })
 			: undefined;
 		if (component.previewArgsKey !== argsKey) {
 			component.preview = undefined;
@@ -175,7 +159,7 @@ export const patchRenderers = {
 		if (context.argsComplete && previewInput && !component.preview && !component.previewPending) {
 			component.previewPending = true;
 			const requestKey = argsKey as string; // previewInput implies argsKey
-			void computePatchDiff(previewInput.path, previewInput.edits, context.cwd).then((preview) => {
+			void computePatchDiff(previewInput.path, previewInput.replacement, context.cwd).then((preview) => {
 				if (component.previewArgsKey === requestKey) {
 					setPreview(component, preview, requestKey);
 					context.invalidate();
@@ -193,7 +177,7 @@ export const patchRenderers = {
 		const callComponent = context.state.callComponent;
 		const previewInput = getRenderablePreviewInput(context.args);
 		const argsKey = previewInput
-			? JSON.stringify({ path: previewInput.path, edits: previewInput.edits })
+			? JSON.stringify({ path: previewInput.path, replacement: previewInput.replacement })
 			: undefined;
 		const resultDiff = !context.isError ? result.details?.diff : undefined;
 		let changed = false;

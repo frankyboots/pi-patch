@@ -16,8 +16,7 @@ similar" is not a reason to skip a hermes behavior.
 
 ## Status snapshot
 
-Implemented so far (against the transitional `edits[]` surface; these survive the Tier 2 #5
-reschema):
+Implemented so far:
 
 - [x] Chain (partial): `exact`, `line_trimmed`, `indentation_flexible`, `trimmed_boundary`
 - [x] Teaching errors: ambiguity locations, did-you-mean sections, whitespace visualization,
@@ -77,11 +76,29 @@ reschema):
       break, spurious `\'`/`\"`, doubled backslash runs), so execute() and
       the TUI preview can never diverge on what gets written. Detection is
       structured; texts are built in `errors.ts` from the JSON-probed hermes
-      messages (repr formatting included), modulo pi tool/param names and the
-      edit-#N-in-path context (ledger #10 + the transitional surface). The
+      messages (repr formatting included), modulo pi tool names (ledger #10) —
+      the param names became verbatim with Tier 2 #5. The
       `TestEscapeDriftGuard` and `TestNewlineLiteralDrift` corpora are
       ported. Spans voted on are the post-non-overlap-filter set (ledger #12
       consequence): only regions that will actually be written may veto.
+- [x] Tier 2 #5: the surface **is** hermes' — `path` + `old_string` + `new_string` +
+      optional `replace_all`, exactly one replacement per call (§6 item 1). The
+      transitional `edits[]` schema is retired: a call that still sends it is
+      refused with a teaching error rather than partially applied (ledger #14),
+      while a *single-entry* `edits[]`, pi's param spellings
+      (`oldText`/`newText`/`replaceAll`, camelCase, `file_path`) and string
+      booleans are still flattened by `preparePatchArguments` — the
+      `schema_sanitizer` analog (ledger #8), now idempotent and re-run inside
+      `execute()` so the gates can't be skipped by an SDK/preview caller.
+      hermes' handler gates run in hermes' order (`path required` →
+      `old_string and new_string required` → empty/whitespace-only/identical →
+      unknown mode), `''` deletes the matched text, and the unadvertised
+      `mode`/`patch` params are accepted from any model but answered with
+      "not available in this build" until Tier 3 (ledger #15). Prompt
+      contribution, TUI renderer (preview runs the same normalized call) and the
+      whole test corpus moved with it; the replace-mode error texts are now
+      byte-exact Appendix B modulo pi tool names (ledger #10) — that closes most
+      of Tier 2 #7, the rest rides on #6 and Tier 3.
 
 ## Build plan (exact-port tiers)
 
@@ -109,15 +126,22 @@ though V4A is now in scope.
 
 ### Tier 2 — replace-mode surface & recovery parity
 
-- [ ] 5. Switch the tool surface to hermes' schema: `path`, `old_string`, `new_string`,
+- [x] 5. Switch the tool surface to hermes' schema: `path`, `old_string`, `new_string`,
       `replace_all` — one replacement per call (§6 item 1). Keep argument normalization as
       the `schema_sanitizer` analog (ledger #8). Update the prompt contribution, renderers,
-      and tests to match.
+      and tests to match. (`preparePatchArguments` flattens single-entry `edits[]` and pi
+      spellings, refuses nothing; `validateCall` owns every gate. Multi-entry `edits[]` →
+      ledger #14, unadvertised `mode`/`patch` → ledger #15.)
 - [ ] 6. Failure counter + escalation (session-scoped): per-path consecutive-miss count,
       failure-#3 "stop retrying" hint, reset on success, and the generic below-threshold
       `_hint` whenever no richer "did you mean" snippet is attached (§4).
 - [ ] 7. Error-text fidelity: Appendix B texts verbatim, modulo tool-name mapping
-      (ledger #10).
+      (ledger #10). *Largely landed with #5:* replace-mode texts (ambiguity +
+      locations, replace_all refusal, no-match + hint + whitespace diagnosis,
+      already-applied, escape-drift, empty/whitespace-only/identical, the arg
+      gates, `Unknown mode:`) are byte-exact and asserted verbatim in
+      `test/patch.test.ts`; what's left rides on #6 (generic `_hint`) and Tier 3
+      (patch-mode parse/validation texts).
 
 ### Tier 3 — V4A patch mode
 
@@ -173,9 +197,9 @@ argument normalization. Everything else follows hermes.
 
 Under the exact-port goal the replace-mode surface is **one replacement per call** (hermes
 semantics) with `replace_all` ported as-is (per-strategy ambiguity counting; similarity
-strategies refuse it). The current `edits[]` multi-edit schema is retired from `patch`
-(§6 item 1); the built-in `edit` tool remains for callers that want it, and V4A's
-multi-hunk/multi-file behavior subsumes the batch use case.
+strategies refuse it). The `edits[]` multi-edit schema is retired from `patch`
+(§6 item 1, landed in Tier 2 #5); the built-in `edit` tool remains for callers that want it,
+and V4A's multi-hunk/multi-file behavior subsumes the batch use case.
 
 ---
 
@@ -195,8 +219,11 @@ first.
 | 5 | No lint/LSP diagnostics in the result | environment-forced (today) | pi has no public lint/LSP harness; Tier 4 #14 tracks it |
 | 6 | `_hint`/`_warning` delivered inside message text (pi results are text content + `isError`), not as JSON envelope fields | environment-forced | hermes' result is a JSON string; pi's is tool-result content. Hint texts preserved verbatim within that constraint |
 | 7 | Constrained sampling kept (`strict: "prefer"`) | platform bonus | orthogonal to tool semantics; hermes compensates via `schema_sanitizer.py` |
-| 8 | Argument normalization kept (`prepareEditArguments`-style coercion) | platform bonus | analog of hermes' coercion layer; harmless under strict sampling |
+| 8 | Argument normalization kept (`preparePatchArguments` coercion shim, re-run idempotently inside `execute()`) | platform bonus | analog of hermes' coercion layer (`schema_sanitizer.py`); maps pi/`edit` param spellings and a single-entry `edits[]` onto hermes' flat schema, never invents a replacement; re-running it keeps the gates unreachable from an SDK or preview caller |
 | 9 | Model-family gate reads `PI_PROVIDER`/`PI_MODEL` instead of hermes' auxiliary client | environment-forced | same fail-closed semantics (§7, §2.1) |
 | 10 | Hint texts name pi's tools (`read`, `grep`, `write`) instead of hermes' (`read_file`, `search_files`, `write_file`) | cosmetic | point the model at tools that exist in this environment |
 | 11 | Read/staleness tracking scoped to the pi session, not a cross-agent registry | environment-forced | single-agent process; the version-tuple comparison itself is still ported (Tier 4 #12) |
 | 12 | `replace_all` de-duplicates self-overlapping line-window spans (leftmost-greedy, str.replace semantics) instead of splicing them | deliberate improvement | hermes' window rungs can emit overlapping spans under `replace_all` and its reverse-order splice then corrupts the file (e.g. ` a\na` over `a\na\na` → `R`); hermes itself fixed exactly this for `_strategy_exact` ("aligns with str.replace") — the same non-overlap invariant is enforced for every strategy |
+| 13 | Base description omits hermes' "Auto-runs syntax checks after editing." promise | environment-forced | pi exposes no lint harness (row #5); advertising it would teach the model to wait for diagnostics that never arrive. The rest of hermes' base description is verbatim |
+| 14 | `edits[]` is not a `patch` parameter: a call carrying it (single entry → flattened, several → refused with a teaching error) | deliberate | the transitional multi-edit surface is retired by #5; silently applying the first of several requested replacements would report work that never happened, so the refusal teaches the flat shape and says "do not re-send this call unchanged" |
+| 15 | `mode`/`patch` are accepted from any model but answered with "V4A … is not available in this build" until Tier 3 | deliberate (interim, removed by Tier 3 #8/#9) | hermes would apply the patch; we must not pretend to. The base schema stays replace-only exactly like hermes' unlayered schema, `Unknown mode: X` keeps hermes' text, and the handler-side acceptance is already in place so Tier 3 only adds the parser. Nuance kept hermes-compatible: hermes' mode dispatch is exclusive and defaults to `replace`, so a **stray** `patch` param on a complete replace call is ignored (the edit lands); only `mode="patch"`, or V4A-looking content with no complete replacement in flight, gets the refusal — where hermes answers `patch content required` we answer "not available", since that is the true statement here |
