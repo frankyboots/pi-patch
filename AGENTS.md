@@ -35,6 +35,14 @@ npx vitest run -t "reindent"   # single test by name
 Run both `npm test` and `npm run typecheck` before declaring work done. There is no build
 step — pi runs the TypeScript source directly.
 
+Ported matching code is differentially tested against the real hermes implementation: when
+touching span-mapping or strategy logic, regenerate the golden corpus
+(`python3 scripts/generate_span_map_golden.py > test/golden/span-map.json`) and make the
+golden suite green; `GOLDEN_SEED=<n>` re-validates on fresh fuzz beyond the committed
+corpus. The corpus is BMP-only — Python code-point indices must equal JS UTF-16 unit
+indices for the recorded spans to be comparable (astral pass-through has a dedicated unit
+test).
+
 ## Layout
 
 ```
@@ -46,7 +54,13 @@ src/errors.ts    teaching error builders (did-you-mean, whitespace viz, recovery
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
 src/render.ts    TUI call/result renderers with live preview (uses OUR engine)
 src/text.ts      LF/BOM/CRLF helpers, line index
+src/span-map.ts  span-mapping helpers ported verbatim from hermes `fuzzy_match.py`
 test/patch.test.ts  single vitest file covering chain, shaping, diff, and tool behavior
+test/golden/     generated golden corpus — reference outputs from the hermes
+                 implementation (do not hand-edit; see scripts/ to regenerate)
+scripts/         generate_span_map_golden.py — regenerates test/golden against
+                 ~/.hermes/hermes-agent (override checkout with HERMES_HOME,
+                 fuzz seed with GOLDEN_SEED); requires python3 but tests don't
 ```
 
 ## Architecture & invariants

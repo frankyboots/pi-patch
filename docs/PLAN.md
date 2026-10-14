@@ -27,6 +27,11 @@ reschema):
 - [x] Own preview renderer (computes the preview with **our** engine, not core's `computeEditsDiff`)
 - [x] Reindent replacement shaping
 - [x] Argument normalization
+- [x] Tier 1 #1 (in progress): span-mapping helpers ported verbatim from
+      `fuzzy_match.py` (`src/span-map.ts`), differentially tested against the
+      reference implementation via a generated golden corpus
+      (`scripts/generate_span_map_golden.py` → `test/golden/span-map.json`);
+      the 5 new strategies themselves are not wired into the chain yet
 
 ## Build plan (exact-port tiers)
 

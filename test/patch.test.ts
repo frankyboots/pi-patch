@@ -8,7 +8,21 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { readFileSync } from "node:fs";
 import { runChain } from "../src/chain.js";
+import {
+	buildOrigToNormMap,
+	calculateLinePositions,
+	collapseWhitespace,
+	exactSpans,
+	mapNormalizedPositions,
+	mapPositionsNormToOrig,
+	matchTransformedLines,
+	stripBoundary,
+	unicodeNormalize,
+	windowSpans,
+	type Span,
+} from "../src/span-map.js";
 import { reindentReplacement } from "../src/shaping.js";
 import { createPatchToolDefinition, prepareEditArguments } from "../src/tool.js";
 import { generateDiffString } from "../src/diff-utils.js";
@@ -217,4 +231,153 @@ describe("tool: execute against real files", () => {
 			run({ path: name, edits: [{ oldText: "   ", newText: "x" }] }, dir),
 		).rejects.toThrow(/whitespace-only|empty/);
 	});
+});
+
+describe("span-map: hermes port unit tests", () => {
+	it("unicodeNormalize maps every hermes UNICODE_MAP class and leaves ASCII alone", () => {
+		expect(unicodeNormalize("a\u2014b\u2013c\u2026d\u00a0e\u2212f")).toBe("a--b-c...d e-f");
+		expect(unicodeNormalize("\u201cq\u201d \u2018s\u2019 \u3000\u2007\u202f")).toBe('"q" \'s\'    ');
+		expect(unicodeNormalize("plain ASCII stays")).toBe("plain ASCII stays");
+	});
+
+	it("exactSpans is non-overlapping (hermes re.finditer semantics)", () => {
+		expect(exactSpans("aaaaaa", "aa").map((s) => [s.start, s.end])).toEqual([[0, 2], [2, 4], [4, 6]]);
+		expect(exactSpans("abc", "")).toEqual([]);
+		expect(exactSpans("xyz", "q")).toEqual([]);
+	});
+
+	it("astral characters pass through the unicode map in UTF-16 units (platform adaptation)", () => {
+		// Python iterates code points; the TS port iterates UTF-16 units — the maps
+		// must stay consistent with JS string indices so spans slice correctly.
+		const content = "a\u{1D54F}\u2014b"; // 𝕏 (2 units) + em dash
+		const norm = unicodeNormalize(content);
+		expect(norm).toBe("a\u{1D54F}--b");
+		const map = buildOrigToNormMap(content);
+		expect(map).toEqual([0, 1, 2, 3, 5, 6]); // a, 𝕏-hi, 𝕏-lo, —, b, sentinel
+		const mapped = mapPositionsNormToOrig(map, exactSpans(norm, "--"));
+		expect(mapped).toEqual([{ start: 3, end: 4 }]);
+		expect(content.slice(mapped[0].start, mapped[0].end)).toBe("\u2014");
+	});
+
+	it("whitespace collapse mapping keeps the word-boundary space after a match", () => {
+		// hermes issue #52491: "foo bar" matching "foo   bar baz" must splice
+		// "foo   bar" and leave the single separating space alone.
+		const content = "foo   bar baz";
+		const collapsed = collapseWhitespace(content);
+		const mapped = mapNormalizedPositions(content, collapsed, exactSpans(collapsed, "foo bar"));
+		expect(mapped).toEqual([{ start: 0, end: 9 }]);
+		expect(content.slice(0, mapped[0].end) + content.slice(mapped[0].end)).toBe(content);
+		expect(content.slice(0, mapped[0].end)).toBe("foo   bar");
+	});
+
+	it("whitespace collapse mapping absorbs a trailing run when the match ends in a space", () => {
+		// pattern "foo " (trailing space) vs "foo   bar baz": the whole 3-space
+		// run is part of the match, so a replacement keeps the separation.
+		const content = "foo   bar baz";
+		const collapsed = collapseWhitespace(content);
+		const mapped = mapNormalizedPositions(content, collapsed, exactSpans(collapsed, "foo "));
+		expect(mapped).toEqual([{ start: 0, end: 6 }]);
+		expect(content.slice(0, mapped[0].end)).toBe("foo   ");
+	});
+
+	it("calculateLinePositions covers windows without the trailing newline and clamps to content", () => {
+		const lines = "one\ntwo\nthree".split("\n");
+		expect(calculateLinePositions(lines, 0, 1, 12)).toEqual({ start: 0, end: 3 });
+		expect(calculateLinePositions(lines, 1, 2, 12)).toEqual({ start: 4, end: 7 });
+		// final line has no newline; the span ends at the content length
+		expect(calculateLinePositions(lines, 2, 3, 12)).toEqual({ start: 8, end: 12 });
+	});
+
+	it("stripBoundary strips only the first and last lines", () => {
+		expect(stripBoundary(["  a  ", "  b  ", "  c  "])).toEqual(["a", "  b  ", "c"]);
+		expect(stripBoundary(["  a  "])).toEqual(["a"]);
+	});
+
+	it("matchTransformedLines finds all windows and reports content-byte spans", () => {
+		const content = "  x = 1\n\ty = 2\n  x = 1\n\ty = 2\n";
+		const spans = matchTransformedLines(content, "x = 1\n\ty = 2", (ls) => ls.map((l) => l.trim()));
+		// spans end at the last matched character — the newline after the window
+		// is not part of the span (hermes _calculate_line_positions semantics)
+		expect(spans).toEqual([
+			{ start: 0, end: 14 },
+			{ start: 15, end: 29 },
+		]);
+		expect(content.slice(spans[0].start, spans[0].end)).toBe("  x = 1\n\ty = 2");
+	});
+});
+
+describe("span-map: golden differential vs hermes fuzzy_match.py", () => {
+	interface GoldenCase {
+		name: string;
+		content: string;
+		pattern: string;
+		unicode: {
+			norm_content: string;
+			norm_pattern: string;
+			content_map: number[];
+			pattern_map: number[];
+			norm_matches: [number, number][];
+			mapped: [number, number][];
+		};
+		whitespace: {
+			collapsed_content: string;
+			collapsed_pattern: string;
+			norm_matches: [number, number][];
+			mapped: [number, number][];
+		};
+		lines_strip: [number, number][];
+		lines_lstrip: [number, number][];
+		lines_strip_boundary: [number, number][];
+		line_positions: [number, number, number, number][];
+	}
+
+	const doc = JSON.parse(
+		readFileSync(new URL("./golden/span-map.json", import.meta.url), "utf-8"),
+	) as { cases: GoldenCase[] };
+
+	const pairs = (spans: Span[]): [number, number][] => spans.map((s) => [s.start, s.end]);
+
+	for (const c of doc.cases) {
+		it(`matches hermes: ${c.name}`, () => {
+			// Unicode space (strategy 7 plumbing)
+			expect(unicodeNormalize(c.content)).toBe(c.unicode.norm_content);
+			expect(unicodeNormalize(c.pattern)).toBe(c.unicode.norm_pattern);
+			expect(buildOrigToNormMap(c.content)).toEqual(c.unicode.content_map);
+			expect(buildOrigToNormMap(c.pattern)).toEqual(c.unicode.pattern_map);
+			const normMatches = exactSpans(c.unicode.norm_content, c.unicode.norm_pattern);
+			expect(pairs(normMatches)).toEqual(c.unicode.norm_matches);
+			expect(pairs(mapPositionsNormToOrig(buildOrigToNormMap(c.content), normMatches)))
+				.toEqual(c.unicode.mapped);
+
+			// Whitespace space (strategy 3 plumbing)
+			const collapsed = collapseWhitespace(c.content);
+			expect(collapsed).toBe(c.whitespace.collapsed_content);
+			expect(collapseWhitespace(c.pattern)).toBe(c.whitespace.collapsed_pattern);
+			const wsMatches = exactSpans(collapsed, c.whitespace.collapsed_pattern);
+			expect(pairs(wsMatches)).toEqual(c.whitespace.norm_matches);
+			expect(pairs(mapNormalizedPositions(c.content, collapsed, wsMatches)))
+				.toEqual(c.whitespace.mapped);
+
+			// Line-window strategies
+			expect(pairs(matchTransformedLines(c.content, c.pattern, (ls) => ls.map((l) => l.trim()))))
+				.toEqual(c.lines_strip);
+			expect(pairs(matchTransformedLines(c.content, c.pattern, (ls) => ls.map((l) => l.replace(/^\s+/, "")))))
+				.toEqual(c.lines_lstrip);
+			expect(pairs(matchTransformedLines(c.content, c.pattern, stripBoundary)))
+				.toEqual(c.lines_strip_boundary);
+
+			// Windowing math: every recorded (i, j) window, plus windowSpans
+			// consistency for n = 1..3 (accept always → all windows of that size).
+			const lines = c.content.split("\n");
+			for (const [i, j, start, end] of c.line_positions) {
+				expect(calculateLinePositions(lines, i, j, c.content.length)).toEqual({ start, end });
+			}
+			for (const n of [1, 2, 3]) {
+				const expected = c.line_positions
+					.filter(([i, j]) => j - i === n)
+					.map(([, , start, end]) => ({ start, end }));
+				expect(windowSpans(c.content, lines, n, () => true)).toEqual(expected);
+			}
+		});
+	}
 });
