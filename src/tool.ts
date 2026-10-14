@@ -25,6 +25,7 @@ import {
 	type LineIndex,
 } from "./text.js";
 import { runChain, type ChainFailure, type ChainMatch, type MatchLocation } from "./chain.js";
+import type { Span } from "./span-map.js";
 import { reindentReplacement } from "./shaping.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
 import {
@@ -34,6 +35,7 @@ import {
 	identicalTextsError,
 	noMatchErrorMessage,
 	overlapErrorMessage,
+	replaceAllRefusalMessage,
 } from "./errors.js";
 
 const replaceEditSchema = Type.Object({
@@ -42,6 +44,12 @@ const replaceEditSchema = Type.Object({
 			"Text to find in the file. Must be unique in the original file and must not overlap with any other edits[].oldText in the same call. Matching tolerates minor whitespace, indentation, and margin differences, but copy the text from the current file content as closely as you can.",
 	}),
 	newText: Type.String({ description: "Replacement text for this targeted edit." }),
+	replaceAll: Type.Optional(
+		Type.Boolean({
+			description:
+				"Replace every non-overlapping occurrence of oldText instead of requiring a unique match. Only use when every occurrence should change. Refused when the match is only approximate (similarity strategies) — provide the precise text (whitespace included) instead.",
+		}),
+	),
 }, {});
 
 const patchSchema = Type.Object({
@@ -52,7 +60,10 @@ const patchSchema = Type.Object({
 	}),
 }, {});
 
-export type PatchToolInput = { path: string; edits: { oldText: string; newText: string }[] };
+export type PatchToolInput = {
+	path: string;
+	edits: { oldText: string; newText: string; replaceAll?: boolean }[];
+};
 
 export interface PatchToolDetails {
 	/** Display-oriented diff of the changes made */
@@ -73,6 +84,7 @@ export const patchToolSystemPromptContribution = {
 		"When changing multiple separate locations in one file, use one patch call with multiple entries in edits[] instead of multiple patch calls",
 		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+		"Set replaceAll on an edit only when every occurrence of oldText should change; approximate (similarity) matches refuse replaceAll — provide the precise text (whitespace included) instead.",
 		"If a patch fails, the error lists the closest matching sections — fix oldText from those sections instead of re-reading the whole file or retrying unchanged",
 	],
 };
@@ -80,12 +92,37 @@ export const patchToolSystemPromptContribution = {
 interface Edit {
 	oldText: string;
 	newText: string;
+	/** hermes replace_all: replace every occurrence of oldText (Tier 1 #2) */
+	replaceAll?: boolean;
 }
 
 function isSingleEditInput(value: unknown): value is Edit {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const edit = value as Record<string, unknown>;
 	return typeof edit.oldText === "string" && typeof edit.newText === "string";
+}
+
+/** hermes' schema spells it `replace_all`; models also send booleans as strings.
+ * Accept both spellings and both value encodings (pi-style coercion, ledger #8). */
+function coerceReplaceAll(value: unknown): boolean | undefined {
+	if (value === true || value === "true") return true;
+	if (value === false || value === "false") return false;
+	return undefined;
+}
+
+/** Normalize the per-edit flag: hermes' snake_case `replace_all` → `replaceAll`,
+ * string booleans → booleans. Unrecognized values pass through untouched so
+ * schema validation reports them loudly. */
+function normalizeEditEntries(edits: unknown): unknown {
+	if (!Array.isArray(edits)) return edits;
+	return edits.map((entry) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+		const e = entry as Record<string, unknown>;
+		const coerced = coerceReplaceAll(e.replaceAll ?? e.replace_all);
+		if (coerced === undefined && !("replace_all" in e)) return entry;
+		const { replace_all: _legacy, ...rest } = e;
+		return coerced === undefined ? rest : { ...rest, replaceAll: coerced };
+	});
 }
 
 /**
@@ -111,11 +148,21 @@ export function prepareEditArguments(input: unknown): PatchToolInput {
 	}
 	if (typeof args.oldText === "string" && typeof args.newText === "string") {
 		const edits = Array.isArray(args.edits) ? [...(args.edits as unknown[])] : [];
-		edits.push({ oldText: args.oldText, newText: args.newText });
+		// Legacy flat surface: a call-level flag rides along (hermes' own schema
+		// is flat — one replacement per call, replace_all next to the strings).
+		const flatAll = coerceReplaceAll(args.replaceAll ?? args.replace_all);
+		edits.push(
+			flatAll === undefined
+				? { oldText: args.oldText, newText: args.newText }
+				: { oldText: args.oldText, newText: args.newText, replaceAll: flatAll },
+		);
 		delete args.oldText;
 		delete args.newText;
+		delete args.replaceAll;
+		delete args.replace_all;
 		args.edits = edits;
 	}
+	args.edits = normalizeEditEntries(args.edits);
 	return args as unknown as PatchToolInput;
 }
 
@@ -154,6 +201,8 @@ function spanLines(index: LineIndex, start: number, end: number): { startLine: n
 
 interface AppliedPatch {
 	newContent: string;
+	/** Total matched spans spliced (replaceAll occurrences included) */
+	replacements: number;
 }
 
 /**
@@ -172,7 +221,9 @@ function applyPatchEdits(
 	const matches: (ChainMatch | null)[] = new Array(edits.length).fill(null);
 	const failures: { index: number; failure: ChainFailure }[] = [];
 	for (let i = 0; i < edits.length; i++) {
-		const result = runChain(normalizedContent, edits[i].oldText);
+		const result = runChain(normalizedContent, edits[i].oldText, {
+			replaceAll: edits[i].replaceAll === true,
+		});
 		if (result.ok) {
 			matches[i] = result.match;
 		} else {
@@ -195,6 +246,7 @@ function applyPatchEdits(
 		if (!ambiguous && missedIndexes.length === 0 && appliedIndexes.length === edits.length) {
 			return { ok: false, errorMessage: `__ALREADY_APPLIED__${alreadyAppliedMessage(path, appliedIndexes)}` };
 		}
+		const refusal = failures.find((f) => f.failure.kind === "replace_all_similarity");
 		let msg: string;
 		if (ambiguous) {
 			const failure = ambiguous.failure as Extract<ChainFailure, { kind: "ambiguous" }>;
@@ -205,6 +257,9 @@ function applyPatchEdits(
 				failure.count,
 				failure.locations as MatchLocation[],
 			);
+		} else if (refusal) {
+			const failure = refusal.failure as Extract<ChainFailure, { kind: "replace_all_similarity" }>;
+			msg = replaceAllRefusalMessage(path, refusal.index + 1, failure.strategy, failure.count);
 		} else {
 			const first = missedIndexes[0];
 			msg = noMatchErrorMessage(path, first + 1, normalizedContent, edits[first].oldText);
@@ -219,37 +274,45 @@ function applyPatchEdits(
 		return { ok: false, errorMessage: msg };
 	}
 
-	// Overlap detection across all matched spans (pi semantics: matched against
-	// the same original content, all-or-nothing).
-	const ordered = matches
-		.map((m, i) => ({ m: m as ChainMatch, i }))
-		.sort((a, b) => a.m.start - b.m.start);
+	// Flatten every edit's matched spans — one per edit, or every occurrence of
+	// a replaceAll edit — matched against the same original content,
+	// all-or-nothing (pi semantics). Spans within one edit never overlap: the
+	// chain enforces str.replace's leftmost-greedy invariant (ledger #12).
+	const spans: { span: Span; editIndex: number; exact: boolean }[] = [];
+	for (let i = 0; i < matches.length; i++) {
+		const m = matches[i];
+		if (!m) continue;
+		for (const span of m.spans) spans.push({ span, editIndex: i, exact: m.exact });
+	}
+	const ordered = [...spans].sort((a, b) => a.span.start - b.span.start);
 	for (let k = 1; k < ordered.length; k++) {
 		const prev = ordered[k - 1];
 		const cur = ordered[k];
-		if (cur.m.start < prev.m.end) {
-			const a = { index: prev.i + 1, ...spanLines(index, prev.m.start, prev.m.end) };
-			const b = { index: cur.i + 1, ...spanLines(index, cur.m.start, cur.m.end) };
+		if (cur.span.start < prev.span.end) {
+			const a = { index: prev.editIndex + 1, ...spanLines(index, prev.span.start, prev.span.end) };
+			const b = { index: cur.editIndex + 1, ...spanLines(index, cur.span.start, cur.span.end) };
 			return { ok: false, errorMessage: overlapErrorMessage(path, a, b) };
 		}
 	}
 
-	// Splice in reverse order; shape non-exact replacements onto the file's indent.
+	// Splice in reverse order; shape non-exact replacements onto EACH region's
+	// indent — occurrences of one replaceAll edit can sit at different depths.
 	const replacements = ordered
 		.slice()
 		.reverse()
-		.map(({ m, i }) => {
-			const matchedText = normalizedContent.slice(m.start, m.end);
-			const newText = m.exact
-				? edits[i].newText
-				: reindentReplacement(edits[i].oldText, edits[i].newText, matchedText);
-			return { start: m.start, end: m.end, newText };
+		.map(({ span, editIndex, exact }) => {
+			const edit = edits[editIndex];
+			const matchedText = normalizedContent.slice(span.start, span.end);
+			const newText = exact
+				? edit.newText
+				: reindentReplacement(edit.oldText, edit.newText, matchedText);
+			return { start: span.start, end: span.end, newText };
 		});
 	let newContent = normalizedContent;
 	for (const r of replacements) {
 		newContent = newContent.slice(0, r.start) + r.newText + newContent.slice(r.end);
 	}
-	return { ok: true, result: { newContent } };
+	return { ok: true, result: { newContent, replacements: replacements.length } };
 }
 
 const defaultEditOperations = {
@@ -264,7 +327,7 @@ export function createPatchToolDefinition(cwd: string): ToolDefinition<typeof pa
 		name: "patch",
 		label: "patch",
 		description:
-			"Edit a single file by replacing a unique region of text. Matching tolerates minor whitespace, indentation, and escape drift, so small differences between oldText and the file will not break the edit — but always copy oldText from the current file content as closely as you can. Every edits[].oldText must match a unique, non-overlapping region. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Failed matches return the closest matching sections so you can correct oldText without re-reading blindly.",
+			"Edit a single file by replacing a unique region of text. Matching tolerates minor whitespace, indentation, and escape drift, so small differences between oldText and the file will not break the edit — but always copy oldText from the current file content as closely as you can. Every edits[].oldText must match a unique, non-overlapping region; set replaceAll on an edit to replace every occurrence of oldText instead (refused when the match is only approximate). If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Failed matches return the closest matching sections so you can correct oldText without re-reading blindly.",
 		promptSnippet: patchToolSystemPromptContribution.snippet,
 		promptGuidelines: [...patchToolSystemPromptContribution.guidelines],
 		parameters: patchSchema,
@@ -326,7 +389,7 @@ export function createPatchToolDefinition(cwd: string): ToolDefinition<typeof pa
 							type: "text",
 							// Model-facing diff (analysis §4: pi's diff never reaches the
 							// model — a free self-check loop for weak models).
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.\n\n${patch}`,
+							text: `Successfully replaced ${applied.result.replacements} block(s) in ${path}.\n\n${patch}`,
 						},
 					],
 					details: {

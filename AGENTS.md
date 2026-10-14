@@ -71,8 +71,8 @@ hermes or add a row to PLAN.md's deviations ledger.
 
 - **Strategy chain order follows hermes (analysis Appendix A)**:
   `exact → line_trimmed → whitespace_normalized → indentation_flexible → escape_normalized →
-  trimmed_boundary → unicode_normalized → block_anchor → context_aware`. The first four are
-  implemented; add the missing five in hermes' order — never reorder or "simplify" the chain.
+  trimmed_boundary → unicode_normalized → block_anchor → context_aware`. All nine are
+  implemented and differentially tested — never reorder or "simplify" the chain.
   Matching runs on LF-normalized content (ledger #2: a deliberate improvement over hermes'
   raw-byte matching) and reports spans into that normalized content; the tool layer maps
   spans back to the original file bytes.
@@ -84,7 +84,10 @@ hermes or add a row to PLAN.md's deviations ledger.
   hermes' single-replacement surface — `old_string`/`new_string`/`replace_all`, one
   replacement per call, multi-hunk/multi-file work moving to the V4A patch mode (PLAN.md
   Tier 2 #5 / Tier 3). Until that reschema lands, keep the multi-edit semantics intact
-  and don't build new features that assume it.
+  and don't build new features that assume it. (`replace_all` itself already landed as
+  Tier 1 #2: a per-edit `replaceAll` flag — plus flat-form coercion — that maps 1:1 onto
+  hermes' flat flag and flattens back at the reschema; see ledger #12 for the
+  self-overlap guard hermes lacks.)
 - **V4A patch mode is in scope, not optional**: `patch` must grow `mode:"patch"` with
   hermes' schema layering (advertised to OpenAI-family models only, fail-closed; accepted
   from any model) — analysis §2.1, PLAN.md Tier 3.

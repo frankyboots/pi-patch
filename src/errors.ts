@@ -35,8 +35,23 @@ export function ambiguityErrorMessage(
 	const rows = locations.map((l) => `  L${l.line}: ${l.snippet}`).join("\n");
 	return [
 		`Found ${count} matches for the old text of edit #${editIndex} in ${path} (matched with ${strategy} tolerance).`,
-		`Provide more surrounding context to make it unique. Matches:`,
+		`Provide more surrounding context to make it unique, or set replaceAll on this edit to replace every occurrence. Matches:`,
 		rows,
+	].join("\n");
+}
+
+/** Hermes refuses replace_all when only a similarity strategy can match —
+ * approximate blocks must never be mass-overwritten (Appendix B, verbatim
+ * modulo the pi-side replaceAll param name). */
+export function replaceAllRefusalMessage(
+	path: string,
+	editIndex: number,
+	strategy: string,
+	count: number,
+): string {
+	return [
+		`Found ${count} approximate matches for the old text of edit #${editIndex} in ${path} via the '${strategy}' strategy.`,
+		`replaceAll only applies to exact matches. Provide the precise text (whitespace included) so an exact/line-trimmed match can be made, or drop replaceAll to replace a single unique occurrence.`,
 	].join("\n");
 }
 

@@ -79,7 +79,8 @@ from hermes. Update it as work lands.
 Short version: done so far is the full 9-strategy chain (`exact` through `context_aware`, in
 hermes' order), teaching errors (did-you-mean sections, whitespace visualization, ambiguity
 locations), the already-applied no-op, the model-facing unified diff + own preview renderer,
-reindent shaping, and argument normalization. Remaining: `replace_all` + escape-drift guards
+reindent shaping, hermes' `replace_all` (per-edit `replaceAll` under the transitional
+surface), and argument normalization. Remaining: escape-drift guards
 + unicode-preserving replacement (Tier 1), the schema switch to hermes' single-replacement
 surface and failure escalation (Tier 2), the V4A `mode:"patch"` port (Tier 3), and
 operational parity — post-write verification, staleness tracking, strategy telemetry (Tier 4).

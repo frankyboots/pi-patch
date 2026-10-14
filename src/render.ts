@@ -44,7 +44,9 @@ interface PatchToolRenderArgs {
 	newText?: unknown;
 }
 
-function getRenderablePreviewInput(args: PatchToolRenderArgs | undefined): { path: string; edits: { oldText: string; newText: string }[] } | null {
+function getRenderablePreviewInput(
+	args: PatchToolRenderArgs | undefined,
+): { path: string; edits: { oldText: string; newText: string; replaceAll?: boolean }[] } | null {
 	if (!args || typeof args.path !== "string") return null;
 	const path = args.path;
 	if (
@@ -58,7 +60,19 @@ function getRenderablePreviewInput(args: PatchToolRenderArgs | undefined): { pat
 		return { path, edits: args.edits as { oldText: string; newText: string }[] };
 	}
 	if (typeof args.oldText === "string" && typeof args.newText === "string") {
-		return { path, edits: [{ oldText: args.oldText, newText: args.newText }] };
+		// Keep the flat-form flag so the preview matches what execute() will do
+		// (same coercion as prepareEditArguments: snake_case + string booleans).
+		const raw = args as Record<string, unknown>;
+		const replaceAll =
+			raw.replace_all === true || raw.replace_all === "true" || raw.replaceAll === true || raw.replaceAll === "true";
+		return {
+			path,
+			edits: [
+				replaceAll
+					? { oldText: args.oldText, newText: args.newText, replaceAll: true }
+					: { oldText: args.oldText, newText: args.newText },
+			],
+		};
 	}
 	return null;
 }

@@ -22,9 +22,10 @@
  *   map spans back with the span-map algebra, so the matched file bytes — not
  *   the pattern's — drive the replacement.
  *
- * `runChain` is the single-replacement orchestrator path (hermes'
- * `fuzzy_find_and_replace` minus `replace_all` and the escape-drift guards,
- * which land with Tier 1 #2/#3 in docs/PLAN.md).
+ * `runChain` is the orchestrator path (hermes' `fuzzy_find_and_replace`):
+ * single-replacement semantics by default, `replaceAll` over every match of
+ * the winning strategy (Tier 1 #2) — minus the escape-drift guards and
+ * unicode-preserving replacement, which land with Tier 1 #3/#4.
  */
 import { buildLineIndex, lineAt, similarity, type LineIndex } from "./text.js";
 import {
@@ -53,10 +54,10 @@ export type StrategyName =
 
 export interface ChainMatch {
 	strategy: StrategyName;
-	/** Start offset of the matched span in the LF-normalized content */
-	start: number;
-	/** End offset (exclusive) of the matched span */
-	end: number;
+	/** Matched spans in the LF-normalized content, ascending and
+	 * non-overlapping. Exactly one span unless `replaceAll` was requested and
+	 * the winning strategy found several occurrences. */
+	spans: Span[];
 	/** True when the matched bytes equal oldText exactly (strategy "exact") */
 	exact: boolean;
 }
@@ -70,9 +71,18 @@ export interface MatchLocation {
 
 export type ChainFailure =
 	| { kind: "ambiguous"; strategy: StrategyName; count: number; locations: MatchLocation[] }
+	/** replace_all requested but the winning strategy only approximates oldText */
+	| { kind: "replace_all_similarity"; strategy: StrategyName; count: number }
 	| { kind: "no_match" };
 
 export type ChainResult = { ok: true; match: ChainMatch } | { ok: false; failure: ChainFailure };
+
+export interface RunChainOptions {
+	/** hermes `replace_all`: apply over EVERY match of the winning strategy
+	 * instead of requiring a unique one. Similarity strategies refuse it
+	 * (approximate matches must never be mass-overwritten — Tier 1 #2). */
+	replaceAll?: boolean;
+}
 
 // ── Strategies ───────────────────────────────────────────────────────────
 // Each takes (content, pattern) and returns spans in the ORIGINAL
@@ -223,17 +233,38 @@ function locationAt(index: LineIndex, content: string, offset: number): MatchLoc
 	return { line, snippet };
 }
 
+/** Leftmost-greedy non-overlap filter — str.replace/re.finditer semantics.
+ * Exact spans are non-overlapping by construction (golden-tested); line-window
+ * strategies can emit self-overlapping adjacent windows (e.g. pattern " a\na"
+ * over "a\na\na" matches at lines 0 and 1). Splicing overlapping spans
+ * corrupts the file — the exact failure hermes fixed for `_strategy_exact`
+ * ("aligns with str.replace") but left open for the window rungs; we enforce
+ * the invariant for every strategy (deviations ledger #12). */
+function nonOverlappingSpans(matches: Span[]): Span[] {
+	const ordered = [...matches].sort((a, b) => a.start - b.start);
+	const kept: Span[] = [];
+	let lastEnd = -1;
+	for (const span of ordered) {
+		if (span.start < lastEnd) continue;
+		kept.push(span);
+		lastEnd = span.end;
+	}
+	return kept;
+}
+
 /**
  * Run the ordered strategy chain for one edit against LF-normalized content.
- * Returns the first winning strategy's span, or the terminal failure:
- * ambiguity in the strategy that found candidates, or no match at all.
+ * Returns the first winning strategy's spans (all of them under `replaceAll`),
+ * or the terminal failure: ambiguity in the strategy that found candidates, a
+ * replace_all refusal from a similarity strategy, or no match at all.
  */
-export function runChain(content: string, oldText: string): ChainResult {
+export function runChain(content: string, oldText: string, options: RunChainOptions = {}): ChainResult {
+	const replaceAll = options.replaceAll === true;
 	const index = buildLineIndex(content);
 	for (const { name, fn } of STRATEGIES) {
 		const matches = fn(content, oldText);
 		if (matches.length === 0) continue;
-		if (matches.length > 1) {
+		if (matches.length > 1 && !replaceAll) {
 			return {
 				ok: false,
 				failure: {
@@ -244,10 +275,16 @@ export function runChain(content: string, oldText: string): ChainResult {
 				},
 			};
 		}
-		return {
-			ok: true,
-			match: { strategy: name, start: matches[0].start, end: matches[0].end, exact: name === "exact" },
-		};
+		if (replaceAll && matches.length > 1 && SIMILARITY_STRATEGIES.has(name)) {
+			// Matches only *approximately* resemble oldText — mass-overwriting
+			// every loose block would be corruption by design (hermes refusal).
+			return {
+				ok: false,
+				failure: { kind: "replace_all_similarity", strategy: name, count: matches.length },
+			};
+		}
+		const spans = replaceAll ? nonOverlappingSpans(matches) : matches;
+		return { ok: true, match: { strategy: name, spans, exact: name === "exact" } };
 	}
 	return { ok: false, failure: { kind: "no_match" } };
 }

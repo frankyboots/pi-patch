@@ -39,6 +39,14 @@ reschema):
       (escape-drift guards), #4 (unicode-preserving replacement,
       `\t`/`\r` unescape). Similarity ratios use the `diff`-package opcode
       stand-in for `SequenceMatcher` (PLAN.md complexity table).
+- [x] Tier 1 #2: `replace_all` ported as-is — `replaceAll` per edit under the
+      transitional surface (flat `replace_all` coercion included): every match
+      of the winning strategy is spliced in `_apply_replacements` order with
+      per-region reindent, ambiguity stays per-strategy, similarity strategies
+      refuse the mass-overwrite with hermes' error text, and the ambiguity
+      error now offers the flag. The hermes `TestReplaceAll` corpus is ported;
+      the per-edit flag stands in for the flat schema one until Tier 2 #5
+      reschemas.
 
 ## Build plan (exact-port tiers)
 
@@ -52,8 +60,10 @@ though V4A is now in scope.
       `escape_normalized`, `unicode_normalized`, `block_anchor`, `context_aware`, with the
       span-mapping helpers ported verbatim from `fuzzy_match.py` (reference order:
       Appendix A). Uniqueness stays per-strategy, counted in that strategy's space (§3.1).
-- [ ] 2. `replace_all`, ported as-is: ambiguity counted per-strategy; similarity strategies
-      refuse it.
+- [x] 2. `replace_all`, ported as-is: ambiguity counted per-strategy; similarity strategies
+      refuse it. (`replaceAll` per edit + flat coercion under the transitional
+      surface; hermes' `TestReplaceAll` corpus ported; see ledger #12 for the
+      self-overlap guard.)
 - [ ] 3. Escape-drift guards on every non-exact match (newline-literal, quote-suspect,
       backslash-doubling) before anything is written.
 - [ ] 4. Replacement shaping completion: `_reindent_replacement` (done), unicode-preserving
@@ -151,3 +161,4 @@ first.
 | 9 | Model-family gate reads `PI_PROVIDER`/`PI_MODEL` instead of hermes' auxiliary client | environment-forced | same fail-closed semantics (§7, §2.1) |
 | 10 | Hint texts name pi's tools (`read`, `grep`, `write`) instead of hermes' (`read_file`, `search_files`, `write_file`) | cosmetic | point the model at tools that exist in this environment |
 | 11 | Read/staleness tracking scoped to the pi session, not a cross-agent registry | environment-forced | single-agent process; the version-tuple comparison itself is still ported (Tier 4 #12) |
+| 12 | `replace_all` de-duplicates self-overlapping line-window spans (leftmost-greedy, str.replace semantics) instead of splicing them | deliberate improvement | hermes' window rungs can emit overlapping spans under `replace_all` and its reverse-order splice then corrupts the file (e.g. ` a\na` over `a\na\na` → `R`); hermes itself fixed exactly this for `_strategy_exact` ("aligns with str.replace") — the same non-overlap invariant is enforced for every strategy |

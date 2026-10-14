@@ -39,7 +39,7 @@ describe("chain: strategy selection", () => {
 		if (r.ok) {
 			expect(r.match.strategy).toBe("exact");
 			expect(r.match.exact).toBe(true);
-			expect(content.slice(r.match.start, r.match.end)).toBe("beta");
+			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe("beta");
 		}
 	});
 
@@ -52,7 +52,7 @@ describe("chain: strategy selection", () => {
 			expect(r.match.strategy).toBe("line_trimmed");
 			expect(r.match.exact).toBe(false);
 			// span keeps the file's real bytes, including the margin
-			expect(content.slice(r.match.start, r.match.end)).toBe("return 1;   ");
+			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe("return 1;   ");
 		}
 	});
 
@@ -88,15 +88,15 @@ describe("chain: strategy selection", () => {
 		const content = "one\ntwo\nthree\n";
 		const r = runChain(content, "two\n");
 		expect(r.ok).toBe(true);
-		if (r.ok) expect(content.slice(r.match.start, r.match.end)).toBe("two\n");
+		if (r.ok) expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe("two\n");
 	});
 });
 
 // ── hermes corpus port (tests/tools/test_fuzzy_match.py) ─────────────────
 //
 // Ported per docs/PLAN.md's validation bar. `fuzzyReplace` mirrors hermes'
-// fuzzy_find_and_replace single-replacement path: chain + splice with reindent
-// shaping. replace_all (Tier 1 #2) and escape-drift guards (Tier 1 #3) and
+// fuzzy_find_and_replace: chain (replaceAll included, Tier 1 #2) + splice with
+// reindent shaping onto EACH region. Escape-drift guards (Tier 1 #3) and
 // unicode-preserving replacement opcodes (Tier 1 #4) land with those steps —
 // corpus cases needing them are ported there.
 
@@ -104,20 +104,31 @@ function fuzzyReplace(
 	content: string,
 	oldText: string,
 	newText: string,
+	opts: { replaceAll?: boolean } = {},
 ): { ok: true; out: string; count: number; strategy: string } | { ok: false; error: string } {
-	const r = runChain(content, oldText);
+	const r = runChain(content, oldText, opts);
 	if (!r.ok) {
 		return {
 			ok: false,
 			error:
 				r.failure.kind === "ambiguous"
 					? `Found ${r.failure.count} matches for old_string.`
-					: "Could not find a match for old_string in the file",
+					: r.failure.kind === "replace_all_similarity"
+						? "replace_all only applies to exact matches"
+						: "Could not find a match for old_string in the file",
 		};
 	}
-	const { start, end, strategy, exact } = r.match;
-	const replacement = exact ? newText : reindentReplacement(oldText, newText, content.slice(start, end));
-	return { ok: true, out: content.slice(0, start) + replacement + content.slice(end), count: 1, strategy };
+	// hermes _apply_replacements: splice end-to-start; non-exact matches are
+	// re-indented onto each region's own indent (regions slice the ORIGINAL
+	// content — offsets stay valid because spans never overlap).
+	let out = content;
+	for (const span of [...r.match.spans].reverse()) {
+		const replacement = r.match.exact
+			? newText
+			: reindentReplacement(oldText, newText, content.slice(span.start, span.end));
+		out = out.slice(0, span.start) + replacement + out.slice(span.end);
+	}
+	return { ok: true, out, count: r.match.spans.length, strategy: r.match.strategy };
 }
 
 describe("corpus: TestWhitespaceDifference (hermes)", () => {
@@ -216,14 +227,14 @@ describe("corpus: TestUnicodeNormalized (hermes)", () => {
 			expect(r.ok).toBe(true);
 			if (r.ok) {
 				expect(r.match.strategy).toBe("unicode_normalized");
-				expect(content.slice(r.match.start, r.match.end)).not.toContain("--"); // original bytes, not the normalized form
+				expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).not.toContain("--"); // original bytes, not the normalized form
 			}
 		}
 		// em-dash expansion boundary: the span must snap to the expansion's
 		// original byte, not shift positions (hermes equal-boundary regression).
 		const r = runChain("value = x\u2014y\n", "value = x--y");
 		expect(r.ok).toBe(true);
-		if (r.ok) expect("value = x\u2014y\n".slice(r.match.start, r.match.end)).toBe("value = x\u2014y");
+		if (r.ok) expect("value = x\u2014y\n".slice(r.match.spans[0].start, r.match.spans[0].end)).toBe("value = x\u2014y");
 	});
 });
 
@@ -256,7 +267,7 @@ describe("corpus: escape_normalized (hermes)", () => {
 		expect(r.ok).toBe(true);
 		if (r.ok) {
 			expect(r.match.strategy).toBe("escape_normalized");
-			expect(content.slice(r.match.start, r.match.end)).toBe(content);
+			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe(content);
 		}
 	});
 
@@ -270,7 +281,7 @@ describe("corpus: escape_normalized (hermes)", () => {
 		expect(r.ok).toBe(true);
 		if (r.ok) {
 			expect(r.match.strategy).toBe("escape_normalized");
-			expect(content.slice(r.match.start, r.match.end)).toBe(content);
+			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe(content);
 		}
 	});
 
@@ -282,7 +293,7 @@ describe("corpus: escape_normalized (hermes)", () => {
 		expect(r.ok).toBe(true);
 		if (r.ok) {
 			expect(r.match.strategy).toBe("escape_normalized");
-			expect(content.slice(r.match.start, r.match.end)).toBe(content.slice(0, -1));
+			expect(content.slice(r.match.spans[0].start, r.match.spans[0].end)).toBe(content.slice(0, -1));
 		}
 	});
 
@@ -321,6 +332,87 @@ describe("corpus: TestContextAwareCorrectness (hermes)", () => {
 		expect(matches).toEqual([]);
 		// Was ~5.5s before anchoring in hermes; generous ceiling to avoid CI flake.
 		expect(elapsed).toBeLessThan(2.0);
+	});
+});
+
+describe("corpus: TestReplaceAll (hermes)", () => {
+	it("test_multiple_matches_without_flag_errors", () => {
+		const r = fuzzyReplace("aaa bbb aaa", "aaa", "ccc");
+		expect(r).toMatchObject({ ok: false, error: "Found 2 matches for old_string." });
+	});
+
+	it("test_multiple_matches_with_flag", () => {
+		const r = fuzzyReplace("aaa bbb aaa", "aaa", "ccc", { replaceAll: true });
+		expect(r).toMatchObject({ ok: true, count: 2, strategy: "exact" });
+		if (r.ok) expect(r.out).toBe("ccc bbb ccc");
+	});
+
+	it("test_self_overlapping_pattern_non_overlapping_matches", () => {
+		// hermes regression: exact must advance by len(pattern) (str.replace
+		// semantics) — 2 non-overlapping matches in "aaaa", not 3 overlapping.
+		const r = fuzzyReplace("aaaa", "aa", "b", { replaceAll: true });
+		expect(r).toMatchObject({ ok: true, count: 2 });
+		if (r.ok) expect(r.out).toBe("bb");
+
+		// single-char pattern still counts every occurrence
+		const single = fuzzyReplace("aaa", "a", "b", { replaceAll: true });
+		expect(single).toMatchObject({ ok: true, count: 3 });
+		if (single.ok) expect(single.out).toBe("bbb");
+
+		// embedded in surrounding content — non-matched parts preserved
+		const embedded = fuzzyReplace("prefix aaaa suffix", "aa", "b", { replaceAll: true });
+		expect(embedded).toMatchObject({ ok: true, count: 2 });
+		if (embedded.ok) expect(embedded.out).toBe("prefix bb suffix");
+
+		// without the flag, the non-overlapping count is reported (2, not 3)
+		const noFlag = fuzzyReplace("aaaa", "aa", "b");
+		expect(noFlag).toMatchObject({ ok: false, error: "Found 2 matches for old_string." });
+	});
+
+	it("test_replace_all_refuses_similarity_strategy", () => {
+		// 'aX\nbZ' never appears exactly; only approximately (bY != bZ) — and no
+		// strategy clears its bar, so hermes reports a plain no-match.
+		const r = fuzzyReplace("aX\nbY\naX\nbY\naX\nbY\n", "aX\nbZ", "QQ\nRR", { replaceAll: true });
+		expect(r).toMatchObject({ ok: false, error: "Could not find a match for old_string in the file" });
+	});
+
+	it("refuses mass-overwrite when a similarity strategy finds several approximate blocks", () => {
+		// hermes refusal path proper: block_anchor finds 2 approximate matches.
+		const content = "start\nmid1\nend\nstart\nmid2\nend";
+		const refused = fuzzyReplace(content, "start\nmid\nend", "QQ", { replaceAll: true });
+		expect(refused).toMatchObject({ ok: false, error: "replace_all only applies to exact matches" });
+		// the same call without the flag is the ordinary ambiguity error
+		const ambiguous = fuzzyReplace(content, "start\nmid\nend", "QQ");
+		expect(ambiguous).toMatchObject({ ok: false, error: "Found 2 matches for old_string." });
+	});
+
+	it("a single approximate match still applies under replace_all (hermes parity)", () => {
+		const r = fuzzyReplace("alpha one\nbeta two\ngamma three\n", "alpha one\nbeta 2\ngamma three", "QQ", {
+			replaceAll: true,
+		});
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "block_anchor" });
+		if (r.ok) expect(r.out).toBe("QQ\n");
+	});
+
+	it("line_trimmed replace_all re-indents onto EACH region's depth", () => {
+		const r = fuzzyReplace(
+			"    alpha\n    beta\n        alpha\n        beta\n",
+			"alpha\nbeta",
+			"gamma\ndelta",
+			{ replaceAll: true },
+		);
+		expect(r).toMatchObject({ ok: true, count: 2, strategy: "line_trimmed" });
+		if (r.ok) expect(r.out).toBe("    gamma\n    delta\n        gamma\n        delta\n");
+	});
+
+	it("self-overlapping line-window matches are de-duplicated, not spliced overlapping", () => {
+		// DEVIATION from hermes (ledger #12): hermes splices the two overlapping
+		// line_trimmed windows and corrupts "a\na\na" into "R"; we keep the
+		// leftmost window (str.replace semantics — the invariant hermes itself
+		// enforces for _strategy_exact) and replace once.
+		const r = fuzzyReplace("a\na\na", " a\na", "R", { replaceAll: true });
+		expect(r).toMatchObject({ ok: true, count: 1, strategy: "line_trimmed" });
+		if (r.ok) expect(r.out).toBe("R\na");
 	});
 });
 
@@ -371,6 +463,30 @@ describe("tool: prepareEditArguments", () => {
 		const out = prepareEditArguments({ path: "f", oldText: "a", newText: "b" });
 		expect(out.edits).toEqual([{ oldText: "a", newText: "b" }]);
 	});
+
+	it("folds a flat replace_all flag into the legacy flat edit", () => {
+		const snake = prepareEditArguments({ path: "f", oldText: "a", newText: "b", replace_all: true });
+		expect(snake.edits).toEqual([{ oldText: "a", newText: "b", replaceAll: true }]);
+		const camel = prepareEditArguments({ path: "f", oldText: "a", newText: "b", replaceAll: "true" });
+		expect(camel.edits).toEqual([{ oldText: "a", newText: "b", replaceAll: true }]);
+	});
+
+	it("normalizes per-edit replace_all (snake_case and string booleans)", () => {
+		const out = prepareEditArguments({
+			path: "f",
+			edits: [
+				{ oldText: "a", newText: "b", replace_all: "false" },
+				{ oldText: "c", newText: "d" },
+			],
+		});
+		expect(out.edits).toEqual([
+			{ oldText: "a", newText: "b", replaceAll: false },
+			{ oldText: "c", newText: "d" },
+		]);
+		// unrecognized values pass through untouched — schema validation reports them
+		const junk = prepareEditArguments({ path: "f", edits: [{ oldText: "a", newText: "b", replaceAll: 5 }] });
+		expect(junk.edits).toEqual([{ oldText: "a", newText: "b", replaceAll: 5 }]);
+	});
 });
 
 describe("tool: execute against real files", () => {
@@ -410,6 +526,65 @@ describe("tool: execute against real files", () => {
 		expect(await fs.readFile(file, "utf-8")).toBe("A\nb\nc\nD\n");
 		expect(res.details?.diff).toContain("+1 A");
 		expect(res.details?.diff).toContain("+4 D");
+	});
+
+	it("replaceAll replaces every occurrence in one edit", async () => {
+		const { dir, file, name } = await tmpFile("aaa bbb aaa\n");
+		const res = await run(
+			{ path: name, edits: [{ oldText: "aaa", newText: "ccc", replaceAll: true }] },
+			dir,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe("ccc bbb ccc\n");
+		const text = res.content.map((c) => (c as { text: string }).text).join("");
+		expect(text).toContain("Successfully replaced 2 block(s)");
+	});
+
+	it("mixed call: replaceAll edit + unique edit, both applied all-or-nothing", async () => {
+		const { dir, file, name } = await tmpFile("aaa bbb aaa\nccc\n");
+		const res = await run(
+			{
+				path: name,
+				edits: [
+					{ oldText: "aaa", newText: "X", replaceAll: true },
+					{ oldText: "ccc", newText: "Y" },
+				],
+			},
+			dir,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe("X bbb X\nY\n");
+		const text = res.content.map((c) => (c as { text: string }).text).join("");
+		expect(text).toContain("Successfully replaced 3 block(s)");
+	});
+
+	it("replaceAll re-indents onto EACH occurrence's depth", async () => {
+		const { dir, file, name } = await tmpFile("    alpha\n    beta\n        alpha\n        beta\n");
+		await run(
+			{ path: name, edits: [{ oldText: "alpha\nbeta", newText: "gamma\ndelta", replaceAll: true }] },
+			dir,
+		);
+		expect(await fs.readFile(file, "utf-8")).toBe("    gamma\n    delta\n        gamma\n        delta\n");
+	});
+
+	it("refuses replace_all over approximate (similarity) matches without writing", async () => {
+		const { dir, file, name } = await tmpFile("start\nmid1\nend\nstart\nmid2\nend\n");
+		await expect(
+			run(
+				{ path: name, edits: [{ oldText: "start\nmid\nend", newText: "QQ", replaceAll: true }] },
+				dir,
+			),
+		).rejects.toThrow(/replaceAll only applies to exact matches/);
+		expect(await fs.readFile(file, "utf-8")).toBe("start\nmid1\nend\nstart\nmid2\nend\n");
+	});
+
+	it("already-applied no-op still wins for a replaceAll edit", async () => {
+		const { dir, file, name } = await tmpFile("value = 42\n");
+		const res = await run(
+			{ path: name, edits: [{ oldText: "zzz = 41", newText: "value = 42", replaceAll: true }] },
+			dir,
+		);
+		const text = res.content.map((c) => (c as { text: string }).text).join("");
+		expect(text).toMatch(/already applied/);
+		expect(await fs.readFile(file, "utf-8")).toBe("value = 42\n");
 	});
 
 	it("rejects overlapping edits without writing", async () => {
