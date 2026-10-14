@@ -10,6 +10,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readFileSync } from "node:fs";
+import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	runChain,
 	strategyContextAware,
@@ -52,6 +54,7 @@ import {
 	whitespaceOnlyOldStringError,
 } from "../src/errors.js";
 import { generateDiffString } from "../src/diff-utils.js";
+import { patchRenderers } from "../src/render.js";
 
 describe("chain: strategy selection", () => {
 	it("matches exactly and reports the exact span", () => {
@@ -899,6 +902,61 @@ describe("diff-utils: display diff", () => {
 		expect(diff).toContain("-2 two");
 		expect(diff).toContain("+2 two!");
 		expect(firstChangedLine).toBe(2);
+	});
+});
+
+describe("render: TUI shell (dogfood: box was ragged on the right, double-padded top/bottom)", () => {
+	// docs/DOGFOOD.md: with the default render shell, core wraps whatever
+	// renderCall() returns in its own background Box. Ours already draws a box,
+	// so the header got two blank rows above and below it, and every line that
+	// passed through the inner box lost its last column: the inner box closes
+	// each line with a background reset, which cancels the OUTER box's
+	// background before the padding cell it appends is written. Core's built-in
+	// edit tool declares renderShell: "self" for exactly this reason.
+	const WIDTH = 110;
+
+	/** Render a `patch` call through the same shell the interactive mode uses. */
+	function renderCallShell(args: Record<string, unknown>, width = WIDTH): string[] {
+		initTheme("dark", false);
+		const definition = { ...createPatchToolDefinition(process.cwd()), ...patchRenderers };
+		const component = new ToolExecutionComponent(
+			"patch",
+			"tc-shell",
+			args,
+			{ outputPad: 1 },
+			definition as never,
+			{ requestRender: () => {} } as never,
+			process.cwd(),
+		);
+		component.setArgsComplete();
+		// The diff preview is async; render() right here shows the settled-off
+		// header box, which is all this regression is about.
+		return component.render(width);
+	}
+
+	it("declares renderShell: self so core does not nest a second background box", () => {
+		expect(patchRenderers.renderShell).toBe("self");
+	});
+
+	it("paints every box line flush to the right edge with a single background wrap", () => {
+		const boxLines = renderCallShell({ path: "src/tool.ts", old_string: "x", new_string: "y" }).filter(
+			(line) => visibleWidth(line) > 0,
+		);
+		expect(boxLines.length).toBeGreaterThan(0);
+		for (const line of boxLines) {
+			expect(line.match(/\u001b\[48;/g) ?? []).toHaveLength(1);
+			expect(line.endsWith("\u001b[49m")).toBe(true);
+			expect(visibleWidth(line)).toBe(WIDTH);
+		}
+	});
+
+	it("keeps exactly one padding row above and below the header", () => {
+		const lines = renderCallShell({ path: "src/tool.ts", old_string: "x", new_string: "y" });
+		const header = lines.findIndex((line) => line.includes("patch"));
+		expect(header).toBe(2); // core's leading spacer, our box's top pad, header
+		expect(visibleWidth(lines[header - 1] ?? "")).toBe(WIDTH);
+		expect(visibleWidth(lines[header + 1] ?? "")).toBe(WIDTH);
+		expect(lines.length).toBe(4); // + box bottom pad — nothing else is padded yet
 	});
 });
 

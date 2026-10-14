@@ -8,6 +8,14 @@
  * errors for edits this tool lands fine (analysis §7 ⚠). Diff body coloring
  * is reimplemented with public theme keys instead of importing pi-internal
  * components.
+ *
+ * `renderShell: "self"` is part of the renderer contract, not decoration: we
+ * draw our own background box, so core must not wrap the component in its
+ * own. Nested boxes (a) double the vertical padding around the header and
+ * (b) make the box ragged on the right — the inner box ends every line with
+ * a background reset, which cancels the outer box's background before its
+ * own padding cell is written, leaving one uncolored column. Same reason the
+ * built-in `edit` tool declares it.
  */
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -144,6 +152,8 @@ function resultErrorText(result: { content?: { type: string; text?: string }[] }
 }
 
 export const patchRenderers = {
+	/** We render our own framed box; core must not add another one (see header). */
+	renderShell: "self" as const,
 	renderCall(args: PatchToolRenderArgs, theme: Theme, context: RenderContext) {
 		const component = getCallComponent(context.state, context.lastComponent);
 		const previewInput = getRenderablePreviewInput(args);
