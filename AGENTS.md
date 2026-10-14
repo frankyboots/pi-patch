@@ -21,7 +21,24 @@ the README's comparison table summarizes the intent.
 **This repo dogfoods the extension**: `.pi/extensions/pi-patch.ts` loads it for every pi
 session started here, so agents have `patch` available by default (alongside `edit`).
 That loader is a thin re-export of `src/index.ts` — never put implementation there; `src/`
-is the single source of truth.
+is the single source of truth. Agents are expected to actually *use* it — see the
+dogfooding policy below.
+
+## Dogfooding policy — `patch` is the daily driver
+
+Both `patch` and `edit` stay operational at all times (that coexistence is the point —
+deviations ledger #1). When working in this repo, treat **`patch` as your default tool for
+file edits** and `edit` as the fallback:
+
+- **Reach for `edit` only when you must finish work that `patch` can't do** — e.g. a
+  limitation of the transitional `edits[]` surface, or a suspected tool bug. Switching is
+  always allowed; never let a `patch` failure block the task.
+- **If `patch` fails or misbehaves — wrong match, wrong shaping, spurious ambiguity,
+  unhelpful error, render glitch — log it** in [docs/DOGFOOD.md](docs/DOGFOOD.md): what you
+  attempted, the error or wrong result verbatim, expected vs actual, and the strategy you
+  expected to match. Then carry on with whatever tool completes the job.
+- **Fixed dogfood bugs become regression tests** in `test/patch.test.ts`, named after the
+  failure mode (see Testing notes).
 
 ## Commands
 
