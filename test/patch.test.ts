@@ -49,6 +49,7 @@ import {
 	rewriteV4APatchPathsForHost,
 } from "../src/v4a-fs.js";
 import { clearPatchFailures, recordPatchFailure, resetPatchFailures } from "../src/failure-tracker.js";
+import { verifyPatchPersisted, verifyWrittenHash } from "../src/verify.js";
 import {
 	applyV4AOperations,
 	applyV4APatch,
@@ -1800,6 +1801,168 @@ describe("tool: failure escalation (hermes _patch_failure_tracker, Tier 2 #6)", 
 		expect(otherMessage).not.toContain("This is failure #");
 		// sample.txt is still at streak #2 → this miss is its #3.
 		expect(await runError(miss, dir)).toContain("This is failure #3 patching 'sample.txt'.");
+	});
+});
+
+describe("post-write verification (hermes persistence gates, Tier 4 #11)", () => {
+	// Port of the hermes write-persistence corpus (test_write_verification.py
+	// + TestPatchReplacePostWriteVerification): a silent persistence failure
+	// must surface as an ERROR, never as success-with-diff. The transport mock
+	// hermes' tests use becomes our injected read/write seams.
+	const hashError = (p: string) =>
+		`Post-write verification failed for ${p}: on-disk content hash differs from the intended write. ` +
+		"The write did not persist correctly — re-read the file and retry.";
+
+	beforeEach(() => clearPatchFailures());
+
+	it("verifyWrittenHash: bytes match passes, bytes differ errors verbatim", () => {
+		const intended = Buffer.from("\uFEFFone\r\ntwo\r\n", "utf-8");
+		expect(verifyWrittenHash("/f", intended, () => Buffer.from(intended))).toBeNull();
+		expect(verifyWrittenHash("/f", intended, () => Buffer.from("stale\n"))).toBe(hashError("/f"));
+	});
+
+	it("verifyWrittenHash: hash that cannot be taken leaves the write standing (verified=None)", () => {
+		// hermes: sha256sum missing/failing → verified omitted, write still ok.
+		expect(
+			verifyWrittenHash("/f", Buffer.from("x"), () => {
+				throw new Error("no hash binary");
+			}),
+		).toBeNull();
+	});
+
+	it("verifyPatchPersisted compares BOM-less, LF-normalized text on both sides", () => {
+		// Windows-text-mode persistence (LF written as CRLF) and the BOM we
+		// prepend on write must not read back as a mismatch.
+		const read = () => Buffer.from("\uFEFFone\r\ntwo\r\n", "utf-8");
+		expect(verifyPatchPersisted("/f", "one\ntwo\n", read)).toBeNull();
+	});
+
+	it("verifyPatchPersisted mismatch is hermes' text with code-point counts", () => {
+		// Python len() counts code points: "😀 ok" is 4 chars, not 5 UTF-16 units.
+		expect(verifyPatchPersisted("/f", "\u{1F600} ok", () => Buffer.from("ab", "utf-8"))).toBe(
+			"Post-write verification failed for /f: on-disk content differs from intended write " +
+				"(wrote 4 chars, read back 2 chars after normalizing line endings). " +
+				"The patch did not persist. Re-read the file and try again.",
+		);
+	});
+
+	it("verifyPatchPersisted read failure is hermes' could-not-re-read text", () => {
+		expect(
+			verifyPatchPersisted("/f", "x", () => {
+				throw new Error("EIO");
+			}),
+		).toBe("Post-write verification failed: could not re-read /f");
+	});
+
+	describe("replace mode (TestPatchReplacePostWriteVerification analog)", () => {
+		async function tmpFile(content: string): Promise<{ dir: string; file: string }> {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-verify-"));
+			const file = path.join(dir, "a.txt");
+			await fs.writeFile(file, content, "utf-8");
+			return { dir, file };
+		}
+		async function runFailing(tool: ReturnType<typeof createPatchToolDefinition>, dir: string): Promise<string> {
+			const error = await tool
+				.execute("verify-call", { path: "a.txt", old_string: "hello", new_string: "hi" } as never, undefined, undefined, {
+					cwd: dir,
+				} as never)
+				.then(
+					() => undefined,
+					(e: unknown) => e,
+				);
+			expect(error).toBeInstanceOf(Error);
+			return error instanceof Error ? error.message : String(error);
+		}
+
+		it("surfaces a silent persistence failure as the wrapped write_file error", async () => {
+			const { dir, file } = await tmpFile("hello world\n");
+			// Seed the streak: a verification failure may neither count (no "Could
+			// not find") nor reset it — only real misses count, only successes reset.
+			expect(recordPatchFailure(file)).toBe(1);
+			// The write reports success but the bytes never land: the sha256 gate
+			// (hermes' write_file) fires first, wrapped like every other
+			// write_file failure by patch_replace.
+			const tool = createPatchToolDefinition("/tmp", { operations: { writeFile: () => Promise.resolve() } });
+			expect(await runFailing(tool, dir)).toBe(`Failed to write changes: ${hashError(file)}`);
+			expect(readFileSync(file, "utf-8")).toBe("hello world\n");
+			expect(recordPatchFailure(file)).toBe(2);
+		});
+
+		it("a verify re-read that fails answers hermes' could-not-re-read", async () => {
+			const { dir, file } = await tmpFile("hello world\n");
+			// Read-back failing means the hash cannot be taken (verified=None, no
+			// error) and the persisted re-read fails outright — hermes' second
+			// corpus case: the write itself landed and stands unverified.
+			const tool = createPatchToolDefinition("/tmp", {
+				operations: {
+					readExact: () => {
+						throw new Error("EIO: verify read failed");
+					},
+				},
+			});
+			expect(await runFailing(tool, dir)).toBe(`Post-write verification failed: could not re-read ${file}`);
+			expect(readFileSync(file, "utf-8")).toBe("hi world\n");
+		});
+
+		it("a real BOM+CRLF write verifies byte-exactly and succeeds", async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-verify-ok-"));
+			const file = path.join(dir, "bom.txt");
+			await fs.writeFile(file, "\uFEFFalpha\r\nbeta\r\n", "utf-8");
+			const tool = createPatchToolDefinition("/tmp");
+			const result = await tool.execute(
+				"verify-call",
+				{ path: "bom.txt", old_string: "alpha", new_string: "ALPHA" } as never,
+				undefined,
+				undefined,
+				{ cwd: dir } as never,
+			);
+			const text = result.content.map((c) => (c as { text?: string }).text ?? "").join("\n");
+			expect(text).toContain("Successfully replaced 1 block(s)");
+			expect(readFileSync(file, "utf-8")).toBe("\uFEFFALPHA\r\nbeta\r\n");
+		});
+	});
+
+	describe("V4A host writes (hash gate inside the host write)", () => {
+		it("a lying read-back fails the Update with hermes' verbatim hash error", async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-v4averify-"));
+			const file = path.join(dir, "a.txt");
+			await fs.writeFile(file, "one\ntwo\n", "utf-8");
+			// Writes do nothing, reads always answer the on-disk (pre-patch) bytes:
+			// validation passes, the apply-phase persistence gate fires, and the
+			// error rides patch_parser's apply wrapper — nothing is reported applied.
+			const ops = createHostV4AFileOps({ read: (p) => readFileSync(p), write: () => {} });
+			const result = applyV4APatch(
+				["*** Begin Patch", `*** Update File: ${file}`, "@@", " one", "-two", "+TWO", "*** End Patch"].join("\n"),
+				ops,
+			);
+			expect(result.success).toBe(false);
+			expect(result.error).toBe(
+				"Apply phase failed (state may be inconsistent — run `git diff` to assess):\n" +
+					`  • Failed to update ${file}: ${hashError(file)}`,
+			);
+			expect(result.filesModified).toEqual([]);
+			expect(readFileSync(file, "utf-8")).toBe("one\ntwo\n");
+		});
+
+		it("hash that cannot be taken leaves the V4A write standing (verified=None)", async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-v4averify2-"));
+			const file = path.join(dir, "ok.txt");
+			await fs.writeFile(file, "one\ntwo\n", "utf-8");
+			let written = false;
+			const ops = createHostV4AFileOps({
+				read: (p) => {
+					if (written) throw new Error("no hash binary");
+					return readFileSync(p);
+				},
+				write: (p, data) => {
+					written = true;
+					writeFileSync(p, data, "utf-8");
+				},
+			});
+			expect(ops.readFileRaw(file).error).toBeNull();
+			expect(ops.writeFile(file, "one\nTWO\n")).toEqual({});
+			expect(readFileSync(file, "utf-8")).toBe("one\nTWO\n");
+		});
 	});
 });
 

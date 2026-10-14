@@ -203,6 +203,29 @@ Implemented so far:
       when single, then the unified diff. V4A misses bypass the failure tracker
       ("V4A misses are rare"), any success resets the touched paths' streaks.
 
+- [x] Tier 4 #11: post-write verification live (`src/verify.ts`). Both hermes
+      persistence gates, in hermes' order and inside the mutation queue:
+      `verifyWrittenHash` (hermes `_verify_written_hash`, the gate inside
+      `write_file`) compares the on-disk sha256 to the exact intended bytes —
+      replace mode wraps its failure like hermes' `patch_replace` wraps every
+      write_file error (`Failed to write changes: …`), and the V4A host ops run
+      it inside `writeFile` so Add/Update writes ride it exactly like hermes'
+      `file_ops.write_file` (surfaced verbatim through `patch_parser`'s
+      `_written`). `verifyPatchPersisted` (hermes `_verify_patch_persisted`,
+      replace mode only) re-reads the exact bytes and compares BOM-less,
+      LF-normalized text on both sides; its mismatch text carries
+      code-point counts (Python `len`, astral-safe). A read-back that cannot be
+      taken answers hermes' `verified=None` — the write stands unverified and
+      verification never breaks a good write. Verification failures carry no
+      "Could not find": they never count toward the failure tracker and never
+      reset it (throw lands before the success reset). Test seams mirror
+      hermes' mockable transport: `createPatchToolDefinition(cwd, { operations })`
+      (incl. `readExact`) and `createHostV4AFileOps(hostFs)`.
+      Hermes corpora ported: `TestWriteVerification` (hash-mismatch hard error,
+      hash-unavailable write stands) and
+      `TestPatchReplacePostWriteVerification` (silent persistence failure →
+      error, failing verify-read → could-not-re-read).
+
 ## Build plan (exact-port tiers)
 
 Tiers are ordered by dependency, not by value: the strategy chain (Tier 1) is the matching
@@ -265,7 +288,8 @@ though V4A is now in scope.
 
 ### Tier 4 — operational parity
 
-- [ ] 11. Post-write verification re-read.
+- [x] 11. Post-write verification re-read. (`src/verify.ts` — `_verify_written_hash`
+      + `_verify_patch_persisted` ported; see the Tier 4 #11 status entry.)
 - [ ] 12. Read-time version capture (`(dev, ino, size, mtime_ns, ctime_ns)` tuple, not bare
       mtime) → staleness warning at edit time.
 - [ ] 13. Strategy telemetry (JSONL) driving threshold tuning on our traffic.
@@ -337,3 +361,4 @@ first.
 | 15 | V4A is advertised only when the OpenAI-family gate passes; off-family sessions see the replace-only schema | deliberate (matches hermes) | hermes layers `mode`/`patch` + the dual-mode description via `dynamic_schema_overrides` only for OpenAI-family main models (fail-closed, §2.1/§7) — off-family sessions never pay the V4A SCHEMA tokens. Off-family ≠ V4A-illiterate, though: hermes still TEACHES the dialect to known coder families via its edit-format prompt steering, a separate mechanism keyed on model-id needles (row #17). The **handler** still accepts both shapes from any model (replay compat), dispatches exclusively on `mode` in hermes' gate order, and answers `patch content required` / `Unknown mode:` verbatim; a stray `patch` param on a complete replace call is ignored, exactly like hermes' exclusive mode dispatch |
 | 16 | The schema layer rides tool **re-registration** (`session_start`/`model_select`/`turn_start` → `registerTool`), not hermes' per-request `dynamic_schema_overrides` | environment-forced | pi fixes `parameters` at registration; re-registering swaps the live definition when the gate flips. `turn_start` is the belt-and-braces tick for model changes that emit no event. If pi grows dynamic overrides, `applyGate` collapses to them |
 | 17 | Edit-format prompt steering (`src/edit-guidance.ts`) ports hermes' `_EDIT_FORMAT_GUIDANCE` needle table, keyed on model-id substrings INDEPENDENT of the schema gate; the replace-family line names `mode='patch'` (V4A) even when the advertised schema omits the param, and a steered family supersedes our bespoke V4A guideline (which survives only for unknown families with the layer advertised) | deliberate (matches hermes) | hermes' coding prompt teaches V4A to off-family coder models for genuinely multi-file edits (agent/coding_context.py) — off-family hermes agents emit V4A despite the replace-only schema and the handler accepts those calls by design; observed in practice and verified against the checkout 2026-10. Guideline texts verbatim modulo ledger #10 tool names (`write_file`→`write`) |
+| 18 | Post-write verification mechanism (`src/verify.ts`): hermes hashes via the `sha256sum` binary over its shell transport and treats ANY hash failure (missing binary, failing exec, unparsable reply) as `verified=None`; the port hashes a synchronous exact-byte re-read with node `crypto`, so its only "hash could not be taken" path is a read that throws — same rule (write stands unverified, no error). `_verify_patch_persisted`'s char counts use code points to match Python `len` (JS `.length` would overcount astral text), and replace mode hands it LF-normalized content instead of hermes' file-ending-normalized string — equivalent because both sides are LF-normalized before the compare and the counts. Verification runs inside `withFileMutationQueue` (hermes: under `lock_path`) | environment-forced | in-process FS + node crypto replace the shell transport; behavior (hard error on mismatch, silent pass when unhashable, texts verbatim) is hermes' — the seams that mock hermes' transport in its tests (`operations` / `HostFs` injection) are the port's test hooks |

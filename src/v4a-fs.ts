@@ -13,6 +13,9 @@
  * - `createHostV4AFileOps` — the real `V4AFileOps` the parser was duck-typed
  *   against: exact-byte host reads/writes with pi's file fidelity (BOM and
  *   CRLF captured on read, restored on write — ledger #2), delete, and move.
+ *   Every content write rides hermes' sha256 persistence gate (Tier 4 #11:
+ *   hermes' V4A Add/Update writes go through `write_file`, which re-hashes
+ *   the disk bytes), surfaced verbatim through `patch_parser`'s `_written`.
  *
  * hermes' `_write_precheck_error` policy gates (sensitive-path denylist,
  * binary-DOCUMENT guard, approval/mirror guards) stay out of scope (ledger #4);
@@ -28,6 +31,7 @@ import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from "./text.js";
 import { pyRepr } from "./errors.js";
+import { verifyWrittenHash } from "./verify.js";
 import type { RawReadResult, V4AFileOps, V4AWriteResult } from "./v4a.js";
 
 // hermes `_V4A_SINGLE_HEADER_RE` / `_V4A_MOVE_HEADER_RE` (mirrors
@@ -126,13 +130,29 @@ function looksBinary(buffer: Buffer): boolean {
 }
 
 /**
+ * Host read/write seam for the V4A file ops — the analog of hermes' mockable
+ * shell transport (`_exec`): tests inject a lying or failing implementation
+ * to drive the post-write persistence gates without corrupting a real
+ * filesystem. Delete/Move stay direct node calls (hermes verifies neither).
+ */
+export interface HostFs {
+	read(path: string): Buffer;
+	write(path: string, data: string): void;
+}
+
+const nodeHostFs: HostFs = {
+	read: (path) => readFileSync(path),
+	write: (path, data) => writeFileSync(path, data, "utf-8"),
+};
+
+/**
  * The real host `V4AFileOps` (hermes' `file_ops` the parser is duck-typed
  * against). Per-path file fidelity (BOM + line ending) is captured on read and
  * restored on write, mirroring replace mode: hermes' write_file re-probes disk
  * for its BOM/ending restoration; we keep what the matching read saw, taken
  * inside the mutation queue, so the probe and the write cannot disagree.
  */
-export function createHostV4AFileOps(): V4AFileOps {
+export function createHostV4AFileOps(hostFs: HostFs = nodeHostFs): V4AFileOps {
 	const fileStates = new Map<string, { bom: string; ending: "\r\n" | "\n" }>();
 	const errText = (e: unknown): string =>
 		e instanceof Error && "code" in e ? `Error code: ${String((e as { code: unknown }).code)}` : String(e);
@@ -140,7 +160,7 @@ export function createHostV4AFileOps(): V4AFileOps {
 		readFileRaw(path: string): RawReadResult {
 			let buffer: Buffer;
 			try {
-				buffer = readFileSync(path);
+				buffer = hostFs.read(path);
 			} catch (e) {
 				// Only ENOENT reports the path ABSENT (the answer that frees an
 				// Add/Move target); any other failure must keep notFound false so
@@ -161,7 +181,15 @@ export function createHostV4AFileOps(): V4AFileOps {
 		writeFile(path: string, content: string): V4AWriteResult {
 			try {
 				const state = fileStates.get(path);
-				writeFileSync(path, (state?.bom ?? "") + restoreLineEndings(content, state?.ending ?? "\n"), "utf-8");
+				const finalText = (state?.bom ?? "") + restoreLineEndings(content, state?.ending ?? "\n");
+				hostFs.write(path, finalText);
+				// hermes' sha256 persistence gate (Tier 4 #11): EVERY write hermes
+				// makes rides write_file, which re-hashes the disk bytes. A
+				// mismatch surfaces verbatim through patch_parser's `_written`
+				// (no "Failed to write changes:" wrap in V4A); a read-back that
+				// cannot be taken stays silent, like hermes' verified=None.
+				const hashError = verifyWrittenHash(path, Buffer.from(finalText, "utf-8"), hostFs.read);
+				if (hashError) return { error: hashError };
 				return {};
 			} catch (e) {
 				return { error: errText(e) };

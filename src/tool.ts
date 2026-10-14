@@ -26,7 +26,7 @@
  * Registered under a separate name so it runs alongside `edit`, never instead
  * of it (ledger #1).
  */
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import * as nodePath from "node:path";
 import { Type } from "typebox";
@@ -37,6 +37,7 @@ import { editFormatGuideline } from "./edit-guidance.js";
 import { fuzzyFindAndReplace, isAlreadyApplied, type StrategyName } from "./chain.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
 import { applyV4APatch } from "./v4a.js";
+import { verifyPatchPersisted, verifyWrittenHash } from "./verify.js";
 import { collectV4AHeaderPaths, createHostV4AFileOps, rewriteV4APatchPathsForHost, withSortedMutationQueue } from "./v4a-fs.js";
 import {
 	alreadyAppliedMessage,
@@ -364,7 +365,14 @@ const defaultEditOperations = {
 	readFile: (path: string) => fsReadFile(path),
 	writeFile: (path: string, content: string) => fsWriteFile(path, content, "utf-8"),
 	access: (path: string) => fsAccess(path, constants.R_OK | constants.W_OK),
+	/** Exact-byte re-read for post-write verification (Tier 4 #11). */
+	readExact: (path: string) => readFileSync(path),
 };
+
+/** Host file-operation seam — the analog of hermes' mockable shell transport:
+ * tests inject lying/failing operations to exercise the post-write
+ * persistence gates without corrupting a real filesystem. */
+export type EditOperations = Partial<typeof defaultEditOperations>;
 
 /** hermes `PATCH_SCHEMA["description"]` verbatim — EXCEPT the "Auto-runs
  * syntax checks after editing." clause, dropped rather than kept (deviations
@@ -440,7 +448,7 @@ async function executeV4ACall(patchArg: string, cwd: string, throwIfAborted: () 
 
 export function createPatchToolDefinition(
 	cwd: string,
-	options: { advertiseV4A?: boolean; modelId?: string } = {},
+	options: { advertiseV4A?: boolean; modelId?: string; operations?: EditOperations } = {},
 	// The advertised schema is one of two concrete TypeBox objects (hermes'
 	// base `PATCH_SCHEMA` / the V4A-layered override); the union keeps the
 	// renderers' argument types checkable for both. The handler re-normalizes
@@ -452,7 +460,7 @@ export function createPatchToolDefinition(
 	// `mode='patch'` even when the advertised schema omits the params, and it
 	// supersedes our generic v4aGuideline when the family is known.
 	const steering = editFormatGuideline(options.modelId);
-	const ops = defaultEditOperations;
+	const ops = { ...defaultEditOperations, ...options.operations };
 	return {
 		name: "patch",
 		label: "patch",
@@ -515,6 +523,18 @@ export function createPatchToolDefinition(
 
 				const finalContent = bom + restoreLineEndings(applied.newContent, originalEnding);
 				await ops.writeFile(absolutePath, finalContent);
+				// Post-write verification (Tier 4 #11), both hermes gates in
+				// patch_replace's order and under the mutation queue: the sha256
+				// gate that lives in hermes' write_file — whose failure
+				// patch_replace wraps like every other write_file error — then
+				// the full `_verify_patch_persisted` re-read. A verification
+				// failure carries no "Could not find", so it never counts toward
+				// the failure tracker (hermes counts it neither), and throwing
+				// before the reset keeps the per-path miss streak intact.
+				const hashError = verifyWrittenHash(absolutePath, Buffer.from(finalContent, "utf-8"), ops.readExact);
+				if (hashError) throw new Error(`Failed to write changes: ${hashError}`);
+				const persistError = verifyPatchPersisted(absolutePath, applied.newContent, ops.readExact);
+				if (persistError) throw new Error(persistError);
 				throwIfAborted();
 				// Success resets the per-path consecutive-miss count so a future
 				// miss starts a fresh count (hermes `_reset_patch_failures`).

@@ -89,6 +89,9 @@ src/failure-tracker.ts  session-scoped consecutive-failure counter + escalation 
                  hermes `_patch_failure_tracker` (Tier 2 #6); keyed by resolved path
                  (ledger #4), 64-path cap, replace-mode misses only
 src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
+src/verify.ts   post-write persistence gates — ports of hermes `_verify_written_hash`
+                 (sha256 re-hash, verified=None when unhashable) + `_verify_patch_persisted`
+                 (exact-byte re-read, BOM/CRLF-tolerant compare) (Tier 4 #11, ledger #18)
 src/v4a.ts       V4A patch parser/applier — port of hermes `patch_parser.py` (parse →
                  validate → apply, Tier 3 #8); duck-typed `V4AFileOps` so tests run
                  in-memory
@@ -171,8 +174,21 @@ hermes or add a row to PLAN.md's deviations ledger.
   appends hermes' "stop retrying" hint (below the threshold a generic hint attaches only
   when the error carries no "Did you mean" section). Any successful patch — including the
   already-applied no-op — resets the path. Ambiguity, escape-drift and identical-strings
-  errors never count (they explain themselves); V4A misses bypass the tracker entirely.
+  errors never count (they explain themselves); post-write verification failures
+  neither count nor reset (no "Could not find" — hermes counts them neither);
+  V4A misses bypass the tracker entirely.
   Keyed by resolved path alone, session-scoped (ledger #4); 64-path cap ported verbatim.
+- **Post-write verification gates every write** (Tier 4 #11, `src/verify.ts`,
+  ledger #18): after the write and still inside the mutation queue, replace mode
+  runs hermes' two gates in order — `verifyWrittenHash` (its failure wrapped as
+  `Failed to write changes: …`, exactly how hermes' `patch_replace` wraps
+  write_file errors) then `verifyPatchPersisted` (verbatim error); V4A Add/Update
+  writes ride the hash gate inside the host `writeFile` (hermes' `file_ops.write_file`
+  analog), surfaced verbatim through `patch_parser`'s apply wrapper. A read-back
+  that cannot be taken is hermes' `verified=None`: the write stands, unverified —
+  verification must never break a good write. Test seams: `operations`
+  (incl. `readExact`) on `createPatchToolDefinition`, `HostFs` on
+  `createHostV4AFileOps` — the analog of hermes' mockable shell transport.
 - **Replacement shaping** (`src/shaping.ts`, hermes orchestrator tail): every match gets
   the conditional `\t`/`\r` unescape over its matched regions (exact included — issue
   #33733; `\n` never rewritten); tolerant matches then re-indent onto the file's indent
