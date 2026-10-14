@@ -92,6 +92,10 @@ src/diff-utils.ts  display diff + unified patch (pi-compatible formats)
 src/verify.ts   post-write persistence gates — ports of hermes `_verify_written_hash`
                  (sha256 re-hash, verified=None when unhashable) + `_verify_patch_persisted`
                  (exact-byte re-read, BOM/CRLF-tolerant compare) (Tier 4 #11, ledger #18)
+src/staleness.ts  read-time version stamps + edit-time staleness warnings — ports of hermes
+                 `_file_metadata`/`_update_read_timestamp`/`_read_mtime_drifted`/
+                 `_check_file_staleness`/`_edit_warnings` (Tier 4 #12, ledger #19/#20);
+                 read stamps are fed by the `tool_result` handler in `src/index.ts`
 src/v4a.ts       V4A patch parser/applier — port of hermes `patch_parser.py` (parse →
                  validate → apply, Tier 3 #8); duck-typed `V4AFileOps` so tests run
                  in-memory
@@ -178,6 +182,19 @@ hermes or add a row to PLAN.md's deviations ledger.
   neither count nor reset (no "Could not find" — hermes counts them neither);
   V4A misses bypass the tracker entirely.
   Keyed by resolved path alone, session-scoped (ledger #4); 64-path cap ported verbatim.
+- **Staleness warns, never blocks** (Tier 4 #12, `src/staleness.ts`): the session stamps a
+  file's version tuple `(dev, ino, size, mtime_ns, ctime_ns)` when it reads it and refreshes
+  the stamp after every successful write (a write is an implicit read). Before an edit lands —
+  inside the mutation queue, like hermes' `_edit_warnings` — every path the call touches is
+  checked and hermes' "modified since you last read it" text (verbatim, naming the model's own
+  path spelling) is appended to the result, error or success, `" | "`-joined for V4A. Keep the
+  hermes asymmetries: never-read and unstattable paths never warn, a failed patch does NOT
+  refresh its stamp, and the warning never joins the failure tracker (it carries no "Could not
+  find") and never blocks or rolls back a write — hermes' refusal lives in `write_file`, which
+  we do not port. Read stamps arrive from the `tool_result` handler in `src/index.ts`
+  (`read` → stamp, `edit`/`write` → refresh, `grep`/`find` never stamp, `patch` stamps its own
+  paths where hermes' `_note_edited` does). Keys are resolved paths; display paths are the
+  model's spelling (ledger #19/#20).
 - **Post-write verification gates every write** (Tier 4 #11, `src/verify.ts`,
   ledger #18): after the write and still inside the mutation queue, replace mode
   runs hermes' two gates in order — `verifyWrittenHash` (its failure wrapped as

@@ -20,6 +20,12 @@
  * file into a "stop retrying" hint (Tier 2 #6; replace mode only — V4A misses
  * bypass the tracker, hermes file_tools.py:1022).
  *
+ * Before an edit lands, hermes' `_edit_warnings` staleness gate runs over every
+ * path the call touches (`staleness.ts`, Tier 4 #12): when the file's version
+ * changed since the session last read it, hermes' "Warning: … modified since you
+ * last read it …" text rides the result — warn-only, exactly like hermes' `patch`
+ * (only its `write_file` refuses) — and the write still proceeds.
+ *
  * Kept from pi (deviations ledger #2/#3/#7/#8): LF pre-normalization with
  * BOM/CRLF restoration, `withFileMutationQueue`, constrained sampling, and the
  * argument-normalization shim that stands in for hermes' `schema_sanitizer.py`.
@@ -33,6 +39,7 @@ import { Type } from "typebox";
 import { withFileMutationQueue, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from "./text.js";
 import { recordPatchFailure, resetPatchFailures } from "./failure-tracker.js";
+import { noteWrite, stalenessWarnings } from "./staleness.js";
 import { editFormatGuideline } from "./edit-guidance.js";
 import { fuzzyFindAndReplace, isAlreadyApplied, type StrategyName } from "./chain.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
@@ -297,7 +304,7 @@ function validateCall(input: PatchToolInput): ValidatedCall {
 	};
 }
 
-function resolveToCwd(filePath: string, cwd: string): string {
+export function resolveToCwd(filePath: string, cwd: string): string {
 	if (filePath.startsWith("~")) {
 		const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
 		if (home) return nodePath.resolve(home, filePath.slice(1));
@@ -333,6 +340,16 @@ function attachNoMatchEscalation(errorMessage: string, trackerKey: string, displ
 		return `${errorMessage}\n\n${genericNoMatchHint()}`;
 	}
 	return errorMessage;
+}
+
+/**
+ * hermes attaches the pre-edit staleness warnings as a `_warning` field on the
+ * result dict — error or success, both carry it. pi results have no JSON
+ * envelope (deviations ledger #6), so the texts append to the message, joined
+ * exactly like hermes' `" | ".join(stale_warnings)`.
+ */
+function appendStalenessWarning(message: string, warnings: readonly string[]): string {
+	return warnings.length === 0 ? message : `${message}\n\n${warnings.join(" | ")}`;
 }
 
 /**
@@ -427,10 +444,21 @@ async function executeV4ACall(patchArg: string, cwd: string, throwIfAborted: () 
 	throwIfAborted();
 	return withSortedMutationQueue(lockedPaths, async () => {
 		throwIfAborted();
+		// hermes `_edit_warnings` runs INSIDE the path locks, before the edit, and
+		// its `_warning` rides the result whether the patch lands or fails. Every
+		// header path participates (hermes checks `_paths_to_check`, Delete and
+		// Move endpoints included) and the texts join with hermes' `" | "`.
+		const warnings = stalenessWarnings(collected.all.map((raw) => [raw, pathToResolved.get(raw) ?? raw] as const));
 		const result = applyV4APatch(hostPatch, createHostV4AFileOps());
 		throwIfAborted();
-		if (result.error) throw new Error(result.error);
+		if (result.error) throw new Error(appendStalenessWarning(result.error, warnings));
 		resetPatchFailures([...pathToResolved.values()]);
+		// hermes `_note_edited`: a successful write is an implicit read of the
+		// current content, so the session's next edit of these files is not
+		// stale. Paths that no longer exist (Delete, Move source) keep their
+		// PREVIOUS stamp — hermes' `getmtime` fails there too, so nothing is
+		// refreshed (and an unstattable path never warns anyway).
+		for (const resolved of pathToResolved.values()) noteWrite(resolved);
 		const filesModified = collected.all.map((raw) => pathToEntry.get(raw) ?? pathToResolved.get(raw) ?? raw);
 		const summary = ["Successfully applied V4A patch.", "", `files_modified: ${filesModified.join(", ")}`];
 		if (result.filesCreated.length > 0) summary.push(`files_created: ${result.filesCreated.join(", ")}`);
@@ -438,7 +466,7 @@ async function executeV4ACall(patchArg: string, cwd: string, throwIfAborted: () 
 		if (filesModified.length === 1) summary.push(`resolved_path: ${filesModified[0]}`);
 		return {
 			content: [
-				{ type: "text" as const, text: summary.join("\n") },
+				{ type: "text" as const, text: appendStalenessWarning(summary.join("\n"), warnings) },
 				...(result.diff ? [{ type: "text" as const, text: result.diff }] : []),
 			],
 			details: { diff: result.diff, patch: result.diff } satisfies PatchToolDetails,
@@ -487,13 +515,18 @@ export function createPatchToolDefinition(
 			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
 			return withFileMutationQueue(absolutePath, async () => {
 				throwIfAborted();
+				// hermes `_edit_warnings` runs INSIDE the path lock, before the edit,
+				// and its `_warning` rides the result whether the patch lands or
+				// fails (Tier 4 #12). Warn only — hermes' `patch` never blocks on
+				// read-stamp drift; `patch` also never re-stamps on failure.
+				const warnings = stalenessWarnings([[path, absolutePath]]);
 				try {
 					await ops.access(absolutePath);
 				} catch (error) {
 					throwIfAborted();
 					const errorMessage =
 						error instanceof Error && "code" in error ? `Error code: ${(error as { code: string }).code}` : String(error);
-					throw new Error(`Could not patch file: ${path}. ${errorMessage}.`);
+					throw new Error(appendStalenessWarning(`Could not patch file: ${path}. ${errorMessage}.`, warnings));
 				}
 				throwIfAborted();
 				const buffer = await ops.readFile(absolutePath);
@@ -515,9 +548,14 @@ export function createPatchToolDefinition(
 						// flows this result through its success branch, so it also
 						// clears the consecutive-miss count (file_tools.py:1020).
 						resetPatchFailures([absolutePath]);
-						return { content: [{ type: "text", text: applied.errorMessage }], details: undefined };
+						return {
+							content: [{ type: "text", text: appendStalenessWarning(applied.errorMessage, warnings) }],
+							details: undefined,
+						};
 					}
-					throw new Error(attachNoMatchEscalation(applied.errorMessage, absolutePath, path));
+					throw new Error(
+						appendStalenessWarning(attachNoMatchEscalation(applied.errorMessage, absolutePath, path), warnings),
+					);
 				}
 				throwIfAborted();
 
@@ -532,13 +570,17 @@ export function createPatchToolDefinition(
 				// the failure tracker (hermes counts it neither), and throwing
 				// before the reset keeps the per-path miss streak intact.
 				const hashError = verifyWrittenHash(absolutePath, Buffer.from(finalContent, "utf-8"), ops.readExact);
-				if (hashError) throw new Error(`Failed to write changes: ${hashError}`);
+				if (hashError) throw new Error(appendStalenessWarning(`Failed to write changes: ${hashError}`, warnings));
 				const persistError = verifyPatchPersisted(absolutePath, applied.newContent, ops.readExact);
-				if (persistError) throw new Error(persistError);
+				if (persistError) throw new Error(appendStalenessWarning(persistError, warnings));
 				throwIfAborted();
 				// Success resets the per-path consecutive-miss count so a future
-				// miss starts a fresh count (hermes `_reset_patch_failures`).
+				// miss starts a fresh count (hermes `_reset_patch_failures`), and
+				// refreshes the read stamp (hermes `_note_edited`): our own write is
+				// an implicit read of the current content, so the next edit here is
+				// not "modified since you last read it".
 				resetPatchFailures([absolutePath]);
+				noteWrite(absolutePath);
 
 				const diffResult = generateDiffString(normalizedContent, applied.newContent);
 				const patch = generateUnifiedPatch(path, normalizedContent, applied.newContent);
@@ -550,9 +592,11 @@ export function createPatchToolDefinition(
 							// model — a free self-check loop for weak models), plus
 							// hermes' absolute-path reporting (`files_modified` +
 							// `resolved_path` are in every patch_tool success payload).
-							text:
+							text: appendStalenessWarning(
 								`Successfully replaced ${applied.replacements} block(s) in ${path}.\n\n` +
-								`files_modified: ${absolutePath}\nresolved_path: ${absolutePath}\n\n${patch}`,
+									`files_modified: ${absolutePath}\nresolved_path: ${absolutePath}\n\n${patch}`,
+								warnings,
+							),
 						},
 					],
 					details: {

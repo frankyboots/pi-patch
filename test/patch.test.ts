@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
@@ -49,6 +49,17 @@ import {
 	rewriteV4APatchPathsForHost,
 } from "../src/v4a-fs.js";
 import { clearPatchFailures, recordPatchFailure, resetPatchFailures } from "../src/failure-tracker.js";
+import {
+	clearReadStamps,
+	drifted,
+	fileVersion,
+	noteRead,
+	noteWrite,
+	READ_STAMPS_CAP,
+	readStampCount,
+	stalenessWarnings,
+	stampForToolResult,
+} from "../src/staleness.js";
 import { verifyPatchPersisted, verifyWrittenHash } from "../src/verify.js";
 import {
 	applyV4AOperations,
@@ -71,6 +82,7 @@ import {
 	findClosestLines,
 	formatNoMatchHint,
 	identicalStringsError,
+	staleFileWarning,
 	visualizeWhitespace,
 	whitespaceOnlyOldStringError,
 } from "../src/errors.js";
@@ -1963,6 +1975,287 @@ describe("post-write verification (hermes persistence gates, Tier 4 #11)", () =>
 			expect(ops.writeFile(file, "one\nTWO\n")).toEqual({});
 			expect(readFileSync(file, "utf-8")).toBe("one\nTWO\n");
 		});
+	});
+});
+
+describe("staleness: read-time version capture + edit-time warning (hermes _check_file_staleness, Tier 4 #12)", () => {
+	async function tmpDir(): Promise<string> {
+		return fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-stale-"));
+	}
+	async function tmpFile(content: string): Promise<{ dir: string; file: string; name: string }> {
+		const dir = await tmpDir();
+		const file = path.join(dir, "sample.txt");
+		await fs.writeFile(file, content, "utf-8");
+		return { dir, file, name: "sample.txt" };
+	}
+
+	const tool = createPatchToolDefinition("/tmp");
+	async function run(input: object, cwd: string) {
+		return tool.execute("stale-call", input as never, undefined, undefined, { cwd } as never);
+	}
+	function textOf(result: { content: { type: string; text?: string }[] }): string {
+		return result.content.map((c) => c.text ?? "").join("\n");
+	}
+	function partsOf(result: { content: { type: string; text?: string }[] }): string[] {
+		return result.content.map((c) => c.text ?? "");
+	}
+	async function errorOf(input: object, cwd: string): Promise<string> {
+		const error = await run(input, cwd).then(
+			() => undefined,
+			(e: unknown) => e,
+		);
+		expect(error).toBeInstanceOf(Error);
+		return error instanceof Error ? error.message : String(error);
+	}
+
+	beforeEach(() => clearReadStamps());
+
+	it("fileVersion answers hermes' 5-tuple (dev, ino, size, mtime_ns, ctime_ns)", async () => {
+		const { dir, file } = await tmpFile("content\n");
+		const version = fileVersion(file);
+		expect(version).not.toBeNull();
+		const st = statSync(file, { bigint: true });
+		expect(version).toEqual([st.dev, st.ino, st.size, st.mtimeNs, st.ctimeNs]);
+		expect(version!.every((field) => typeof field === "bigint")).toBe(true);
+		// hermes `_file_metadata` answers None when the path cannot be stat'ed
+		expect(fileVersion(path.join(dir, "missing.txt"))).toBeNull();
+	});
+
+	it("the warning text is hermes' `_check_file_staleness` verbatim", () => {
+		expect(staleFileWarning("src/tool.ts")).toBe(
+			"Warning: src/tool.ts was modified since you last read it " +
+				"(external edit or concurrent agent). The content you read may be " +
+				"stale. Consider re-reading the file to verify before writing.",
+		);
+	});
+
+	it("warns when the file changed after the read stamp — and still writes (warn, never block)", async () => {
+		const { dir, file, name } = await tmpFile("alpha\nbeta\ngamma\n");
+		noteRead(file);
+		writeFileSync(file, "alpha\nBETA (external editor)\ngamma\n");
+		const result = await run({ path: name, old_string: "gamma", new_string: "delta" }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("alpha\nBETA (external editor)\ndelta\n");
+		const text = textOf(result);
+		expect(text).toContain("Successfully replaced 1 block(s)");
+		// hermes sets `_warning` alongside the payload; ledger #6 rides it in the text
+		expect(text.endsWith(`\n\n${staleFileWarning(name)}`)).toBe(true);
+	});
+
+	it("stays silent for a file the session never read (first-touch edits are quiet)", async () => {
+		const { dir, name } = await tmpFile("alpha\nbeta\n");
+		const text = textOf(await run({ path: name, old_string: "beta", new_string: "gamma" }, dir));
+		expect(text).toContain("Successfully replaced 1 block(s)");
+		expect(text).not.toContain("Warning:");
+		// …and an unchanged file after a read is quiet too
+		noteRead(path.join(dir, "sample.txt"));
+		expect(textOf(await run({ path: name, old_string: "alpha", new_string: "alfa" }, dir))).not.toContain("Warning:");
+	});
+
+	it("its own write refreshes the stamp: consecutive patches by one session never warn", async () => {
+		const { dir, file, name } = await tmpFile("a\nb\nc\n");
+		noteRead(file);
+		expect(textOf(await run({ path: name, old_string: "b", new_string: "B" }, dir))).not.toContain("Warning:");
+		// the file has moved twice since the model's read, but both writers were us
+		expect(textOf(await run({ path: name, old_string: "c", new_string: "C" }, dir))).not.toContain("Warning:");
+		expect(drifted(file)).toBe(false);
+	});
+
+	it("a failed patch carries the warning too and leaves the stale stamp in place", async () => {
+		const { dir, file, name } = await tmpFile("alpha\nbeta\n");
+		noteRead(file);
+		writeFileSync(file, "alpha\nBETA\n");
+		const message = await errorOf({ path: name, old_string: "nothing like this at all", new_string: "x" }, dir);
+		expect(message).toContain("Could not find a match for old_string");
+		expect(message.endsWith(`\n\n${staleFileWarning(name)}`)).toBe(true);
+		// hermes' `_note_edited` runs on success only: the miss keeps the old stamp
+		expect(drifted(file)).toBe(true);
+	});
+
+	it("flags a file replaced under the same path even with bytes, size and mtime restored", async () => {
+		// The point of the version tuple over hermes' bare mtime: an editor,
+		// `cp --preserve` or `git checkout` can hand back the same bytes, the
+		// same size and a re-applied mtime — the inode (and the un-backdatable
+		// ctime) cannot lie. `utimes` can only restate mtime to millisecond
+		// precision, so this pins the millisecond part and still flags.
+		const { file } = await tmpFile("same bytes\n");
+		noteRead(file);
+		const before = statSync(file);
+		const mtimeMs = Math.floor(before.mtimeMs);
+		rmSync(file);
+		writeFileSync(file, "same bytes\n");
+		utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+		const after = statSync(file);
+		expect(after.size).toBe(before.size);
+		// mtime is restated to the recorded value (within the millisecond the
+		// `utimes` round trip loses to float seconds), so a size+mtime check
+		// would call this file unchanged…
+		expect(Math.abs(after.mtimeMs - mtimeMs)).toBeLessThanOrEqual(2);
+		// …but the ctime cannot be faked without root: `utimes` stamps it with
+		// NOW. The version tuple sees that, which is why it carries ctime_ns.
+		expect(after.ctimeMs).toBeGreaterThan(before.ctimeMs);
+		expect(drifted(file)).toBe(true);
+	});
+
+	it("noteWrite (pi's edit/write results) clears an external-change warning", async () => {
+		const { file } = await tmpFile("a\nb\n");
+		noteRead(file);
+		writeFileSync(file, "a\nB\n");
+		expect(drifted(file)).toBe(true);
+		// pi's built-in `edit`/`write` just rewrote it: hermes would have stamped
+		// the write in `_note_edited`, and so does the event handler.
+		noteWrite(file);
+		expect(drifted(file)).toBe(false);
+	});
+
+	it("stamps nothing for failed calls, non-file tools, or patch (which stamps itself)", () => {
+		expect(stampForToolResult({ toolName: "read", isError: false, input: { path: "a.ts" } })).toEqual({
+			kind: "read",
+			path: "a.ts",
+		});
+		expect(stampForToolResult({ toolName: "edit", isError: false, input: { path: "a.ts" } })).toEqual({
+			kind: "write",
+			path: "a.ts",
+		});
+		expect(stampForToolResult({ toolName: "write", isError: false, input: { path: "a.ts" } })).toEqual({
+			kind: "write",
+			path: "a.ts",
+		});
+		// a failed read served no content; hermes records no stamp
+		expect(stampForToolResult({ toolName: "read", isError: true, input: { path: "a.ts" } })).toBeUndefined();
+		// hermes' search_files never stamped, so grep/find/ls do not either
+		expect(stampForToolResult({ toolName: "grep", isError: false, input: { path: "a.ts" } })).toBeUndefined();
+		expect(stampForToolResult({ toolName: "ls", isError: false })).toBeUndefined();
+		// patch stamps every path it touched inside execute() (V4A headers are
+		// not in `input`, so the event could not cover them)
+		expect(stampForToolResult({ toolName: "patch", isError: false, input: { path: "a.ts" } })).toBeUndefined();
+		// a call with no usable path is not a read of anything
+		expect(stampForToolResult({ toolName: "read", isError: false, input: { path: "" } })).toBeUndefined();
+	});
+
+	it("bounds tracked paths at hermes' _READ_TIMESTAMPS_CAP, evicting the oldest", async () => {
+		const dir = await tmpDir();
+		const paths: string[] = [];
+		for (let i = 0; i < READ_STAMPS_CAP; i++) {
+			const file = path.join(dir, `f${i}.txt`);
+			writeFileSync(file, "x\n");
+			noteRead(file);
+			paths.push(file);
+		}
+		expect(readStampCount()).toBe(READ_STAMPS_CAP);
+		writeFileSync(paths[0], "changed and longer\n");
+		expect(drifted(paths[0])).toBe(true);
+		// one more path trims the oldest, like `_cap_read_tracker_data`
+		const extra = path.join(dir, "extra.txt");
+		writeFileSync(extra, "x\n");
+		noteRead(extra);
+		expect(readStampCount()).toBe(READ_STAMPS_CAP);
+		expect(drifted(paths[0])).toBe(false); // stamp evicted: never-read, never-warn
+		expect(drifted(paths[1])).toBe(false); // still tracked, still unchanged
+		writeFileSync(paths[1], "changed and longer\n");
+		expect(drifted(paths[1])).toBe(true);
+	});
+
+	it("V4A: every stale header path warns, joined like hermes' ' | '", async () => {
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "a.txt"), "one\ntwo\n", "utf-8");
+		await fs.writeFile(path.join(dir, "b.txt"), "three\nfour\n", "utf-8");
+		noteRead(path.join(dir, "a.txt"));
+		noteRead(path.join(dir, "b.txt"));
+		writeFileSync(path.join(dir, "a.txt"), "one\nTWO\n");
+		writeFileSync(path.join(dir, "b.txt"), "three\nFOUR\n");
+		const result = await run(
+			{
+				mode: "patch",
+				patch: [
+					"*** Begin Patch",
+					"*** Update File: a.txt",
+					"@@",
+					" one",
+					"-TWO",
+					"+ZED",
+					"*** Update File: b.txt",
+					"@@",
+					" three",
+					"-FOUR",
+					"+YAK",
+					"*** End Patch",
+				].join("\n"),
+			},
+			dir,
+		);
+		const summary = partsOf(result)[0] ?? "";
+		const text = textOf(result);
+		expect(summary).toContain("Successfully applied V4A patch.");
+		// hermes appends `_warning` to the patch_tool payload; the unified diff
+		// rides as a SECOND content part (ledger #6), so the warning closes the
+		// summary part and lists every stale header path, hermes-joined.
+		expect(summary.endsWith(`\n\n${staleFileWarning("a.txt")} | ${staleFileWarning("b.txt")}`)).toBe(true);
+		expect(text).toContain("-FOUR");
+		// the successful apply stamped both files (hermes `_note_edited`)
+		expect(stalenessWarnings([["a.txt", path.join(dir, "a.txt")], ["b.txt", path.join(dir, "b.txt")]])).toEqual([]);
+	});
+
+	it("V4A misses carry the warning on the error too", async () => {
+		const dir = await tmpDir();
+		const file = path.join(dir, "a.txt");
+		await fs.writeFile(file, "one\ntwo\n", "utf-8");
+		noteRead(file);
+		writeFileSync(file, "one\nTWO\n");
+		const message = await errorOf(
+			{
+				mode: "patch",
+				patch: ["*** Begin Patch", "*** Update File: a.txt", "@@", " one", "-never matched", "+x", "*** End Patch"].join(
+					"\n",
+				),
+			},
+			dir,
+		);
+		expect(message).toContain("Could not find a match for old_string");
+		expect(message.endsWith(`\n\n${staleFileWarning("a.txt")}`)).toBe(true);
+	});
+});
+
+describe("extension wiring: tool_result stamps the versions (Tier 4 #12, ledger #19)", () => {
+	it("stamps successful read/edit/write results, keyed the way patch resolves them", async () => {
+		clearReadStamps();
+		const { default: piPatchExtension } = await import("../src/index.js");
+		const handlers = new Map<string, (event: never, ctx: never) => void>();
+		piPatchExtension({
+			registerTool: () => undefined,
+			on: (name: string, handler: (event: never, ctx: never) => void) => handlers.set(name, handler),
+		} as never);
+		const toolResult = handlers.get("tool_result");
+		expect(toolResult).toBeTypeOf("function");
+
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-wiring-"));
+		const file = path.join(dir, "sample.txt");
+		writeFileSync(file, "a\nb\n");
+		// A `read` of the RELATIVE spelling must key the stamp the way `patch`
+		// resolves the same call, or the warning would never clear.
+		toolResult!(
+			{ toolName: "read", isError: false, input: { path: "sample.txt" } } as never,
+			{ cwd: dir } as never,
+		);
+		writeFileSync(file, "a\nB\n");
+		expect(drifted(file)).toBe(true);
+		// pi's `edit` rewrote it — a write is an implicit read (hermes _note_edited)
+		toolResult!(
+			{ toolName: "edit", isError: false, input: { path: "sample.txt" } } as never,
+			{ cwd: dir } as never,
+		);
+		expect(drifted(file)).toBe(false);
+		// a failed read saw nothing; `grep` never stamped in hermes; `patch`
+		// stamps inside its own execute
+		writeFileSync(file, "a\nC\n");
+		toolResult!({ toolName: "read", isError: true, input: { path: "sample.txt" } } as never, { cwd: dir } as never);
+		expect(drifted(file)).toBe(true);
+		toolResult!({ toolName: "grep", isError: false, input: { path: "sample.txt" } } as never, { cwd: dir } as never);
+		expect(drifted(file)).toBe(true);
+		toolResult!({ toolName: "patch", isError: false, input: { path: "sample.txt" } } as never, { cwd: dir } as never);
+		expect(drifted(file)).toBe(true);
+		// `write` clears it
+		toolResult!({ toolName: "write", isError: false, input: { path: "sample.txt" } } as never, { cwd: dir } as never);
+		expect(drifted(file)).toBe(false);
 	});
 });
 

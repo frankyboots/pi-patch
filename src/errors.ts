@@ -255,6 +255,20 @@ export function failureEscalationHint(failureCount: number, path: string): strin
 	);
 }
 
+/**
+ * hermes `_check_file_staleness` warning (file_tools_read_tracking.py), the one
+ * `_edit_warnings` source the port implements (Tier 4 #12). Verbatim — the text
+ * names no tools, so ledger #10 has nothing to map. Warn, never block: hermes'
+ * `patch` warns on read-stamp drift and only `write_file` refuses (analysis §2).
+ */
+export function staleFileWarning(path: string): string {
+	return (
+		`Warning: ${path} was modified since you last read it ` +
+		"(external edit or concurrent agent). The content you read may be " +
+		"stale. Consider re-reading the file to verify before writing."
+	);
+}
+
 /** hermes `patch_tool` argument gates (verbatim `tool_error` texts). */
 export function missingPathError(): string {
 	return "path required";

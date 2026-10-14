@@ -100,10 +100,12 @@ unified diff + own preview renderer, argument normalization, the failure counter
 Update hunks through the shared chain), the OpenAI-family schema layering (`src/gate.ts`,
 Tier 3 #9 — base schema stays replace-only; the `mode`/`patch` layer re-registers when the
 gate passes), and the V4A tool-layer plumbing (`src/v4a-fs.ts`, Tier 3 #10 — header traversal
-veto, sorted mutation queueing, absolute `files_modified`), plus the first slice of
-operational parity: post-write verification (`src/verify.ts`, Tier 4 #11 — hermes' sha256
-re-hash + full re-read persistence gates). Remaining: staleness tracking, strategy
-telemetry (Tier 4).
+veto, sorted mutation queueing, absolute `files_modified`), plus operational parity:
+post-write verification (`src/verify.ts`, Tier 4 #11 — hermes' sha256 re-hash +
+full re-read persistence gates) and read-time version stamps with edit-time
+staleness warnings (`src/staleness.ts`, Tier 4 #12 — hermes' `_edit_warnings`
+gate, warn-only, fed from pi's `tool_result` events). Remaining: strategy
+telemetry (Tier 4 #13).
 
 ## Development
 
@@ -130,6 +132,8 @@ src/errors.ts     teaching error builders (did-you-mean, whitespace viz)
 src/failure-tracker.ts  per-path consecutive-miss counter + escalation (hermes tracker)
 src/diff-utils.ts display diff + unified patch (pi-compatible formats)
 src/verify.ts     post-write persistence gates (hermes sha256 re-hash + re-read, ledger #18)
+src/staleness.ts  read-time version stamps + edit-time staleness warnings (hermes
+                  _file_metadata/_update_read_timestamp/_check_file_staleness, ledger #19/#20)
 src/render.ts     TUI call/result renderers with live preview via our engine
 src/text.ts       LF/BOM/CRLF helpers, line index
 src/span-map.ts   span-mapping helpers ported verbatim from hermes fuzzy_match.py

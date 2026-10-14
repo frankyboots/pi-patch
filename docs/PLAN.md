@@ -226,6 +226,27 @@ Implemented so far:
       `TestPatchReplacePostWriteVerification` (silent persistence failure →
       error, failing verify-read → could-not-re-read).
 
+- [x] Tier 4 #12: read-time version capture + edit-time staleness warning live
+      (`src/staleness.ts`, read stamps fed from `src/index.ts`). hermes' shape,
+      ported: stamp the file when the session reads it, refresh the stamp after
+      every successful write (a write is an implicit read — `_note_edited`), and
+      inside the path lock, BEFORE the edit, run `_edit_warnings` over every path
+      the call touches and hang the `" | "`-joined result on the payload whether
+      the patch lands or fails (`file_tools.py:988`, `:1010`). **Warn-only** —
+      hermes' `patch` never blocks on drift (only its `write_file` refuses, and
+      that read-before-write gate stays out of scope). Stamp = hermes'
+      `_file_metadata` 5-tuple rather than hermes' bare `getmtime` (ledger #19);
+      stamp SOURCE = pi's `tool_result` events, since pi's `read`/`edit`/`write`
+      are core tools we do not own (ledger #20). Session-scoped, keyed by
+      resolved path, capped at hermes' `_READ_TIMESTAMPS_CAP` (1000) with
+      oldest-by-insertion eviction like `_cap_read_tracker_data`. hermes'
+      asymmetries preserved: never-read files never warn (first-touch edits are
+      quiet), unstattable files never warn (a deleted file is the write's
+      problem), failed patches leave the stale stamp in place, V4A warns for
+      every header path including Delete/Move endpoints, and the text is
+      `_check_file_staleness` verbatim naming the model's own path spelling
+      (`errors.ts`; no tool name, so ledger #10 does not apply).
+
 ## Build plan (exact-port tiers)
 
 Tiers are ordered by dependency, not by value: the strategy chain (Tier 1) is the matching
@@ -290,8 +311,10 @@ though V4A is now in scope.
 
 - [x] 11. Post-write verification re-read. (`src/verify.ts` — `_verify_written_hash`
       + `_verify_patch_persisted` ported; see the Tier 4 #11 status entry.)
-- [ ] 12. Read-time version capture (`(dev, ino, size, mtime_ns, ctime_ns)` tuple, not bare
-      mtime) → staleness warning at edit time.
+- [x] 12. Read-time version capture (`(dev, ino, size, mtime_ns, ctime_ns)` tuple, not bare
+      mtime) → staleness warning at edit time. (`src/staleness.ts` + the
+      `tool_result` wiring in `src/index.ts`; see the Tier 4 #12 status entry and
+      ledger #19/#20.)
 - [ ] 13. Strategy telemetry (JSONL) driving threshold tuning on our traffic.
 - [ ] 14. Lint/LSP delta in the result — blocked in pi today (ledger #5); revisit if pi
       grows a public harness.
@@ -362,3 +385,5 @@ first.
 | 16 | The schema layer rides tool **re-registration** (`session_start`/`model_select`/`turn_start` → `registerTool`), not hermes' per-request `dynamic_schema_overrides` | environment-forced | pi fixes `parameters` at registration; re-registering swaps the live definition when the gate flips. `turn_start` is the belt-and-braces tick for model changes that emit no event. If pi grows dynamic overrides, `applyGate` collapses to them |
 | 17 | Edit-format prompt steering (`src/edit-guidance.ts`) ports hermes' `_EDIT_FORMAT_GUIDANCE` needle table, keyed on model-id substrings INDEPENDENT of the schema gate; the replace-family line names `mode='patch'` (V4A) even when the advertised schema omits the param, and a steered family supersedes our bespoke V4A guideline (which survives only for unknown families with the layer advertised) | deliberate (matches hermes) | hermes' coding prompt teaches V4A to off-family coder models for genuinely multi-file edits (agent/coding_context.py) — off-family hermes agents emit V4A despite the replace-only schema and the handler accepts those calls by design; observed in practice and verified against the checkout 2026-10. Guideline texts verbatim modulo ledger #10 tool names (`write_file`→`write`) |
 | 18 | Post-write verification mechanism (`src/verify.ts`): hermes hashes via the `sha256sum` binary over its shell transport and treats ANY hash failure (missing binary, failing exec, unparsable reply) as `verified=None`; the port hashes a synchronous exact-byte re-read with node `crypto`, so its only "hash could not be taken" path is a read that throws — same rule (write stands unverified, no error). `_verify_patch_persisted`'s char counts use code points to match Python `len` (JS `.length` would overcount astral text), and replace mode hands it LF-normalized content instead of hermes' file-ending-normalized string — equivalent because both sides are LF-normalized before the compare and the counts. Verification runs inside `withFileMutationQueue` (hermes: under `lock_path`) | environment-forced | in-process FS + node crypto replace the shell transport; behavior (hard error on mismatch, silent pass when unhashable, texts verbatim) is hermes' — the seams that mock hermes' transport in its tests (`operations` / `HostFs` injection) are the port's test hooks |
+| 19 | The staleness stamp is hermes' `_file_metadata` 5-tuple `(dev, ino, size, mtime_ns, ctime_ns)`, not the bare `os.path.getmtime` hermes actually stores in `read_timestamps` (`_update_read_timestamp`, compared by `_read_mtime_drifted`) | deliberate (plan Tier 4 #12) | the gate is advisory in both engines — `patch` warns and writes anyway — so the only cost of the wider net is an extra "re-read first" nudge, and the tuple sees drift a bare mtime cannot: bytes restored with a re-applied mtime (`cp --preserve`, `git checkout`, editors that rewrite in place — `ctime` cannot be backdated without root), or a different file moved over the same path (`dev`/`ino`). It is hermes' own notion of "same file version" (`_file_metadata` backs its dedup/write-baseline tracking), not an invented one; `_file_version`'s content-hash snapshot stays unported (it exists for `write_file`'s read-before-write gate, out of scope). Analysis §2's table row corrected to describe hermes' real (mtime) stamp when this landed |
+| 20 | Read stamps are captured from pi's `tool_result` events in the extension (`src/index.ts`), one tracker per pi session keyed by resolved path — no `task_id`, no cross-agent `FileStateRegistry`, no `read_coverage` page windows, no `full_write_baselines`, no `_path_resolution_warning` | environment-forced | pi's `read`/`edit`/`write` are core tools the extension cannot instrument from inside, so the stamp rides their results: successful `read` → stamp, successful `edit`/`write` → refresh (hermes stamps writes because a write is an implicit read), `patch` stamps its own paths inside `execute` (a V4A call's header paths are not in its `input`, so no event could cover them), failed calls stamp nothing, and `grep`/`find` stamp nothing because hermes' `search_files` never stamped. Partial reads (`offset`/`limit`) stamp the file's whole current version — hermes' stamp is likewise a plain per-path mtime; the paging nuance lives in the unported `read_coverage`. The cross-agent and workspace-divergence warning sources are row #11's scope; only the per-task staleness source is ported, and it stays the last-resort warning hermes ranks last |
