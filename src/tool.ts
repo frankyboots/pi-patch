@@ -5,7 +5,9 @@
  * call** (multi-hunk/multi-file work is the V4A patch mode's job, Tier 3). The
  * matching core is hermes' too: the 9-strategy chain, the escape-drift guards,
  * the orchestrator tail (conditional `\t`/`\r` unescape, unicode-preserving
- * opcodes, reindent, splice) and the teaching errors.
+ * opcodes, reindent, splice), the teaching errors, and the session-scoped
+ * failure-escalation tracker that turns repeated misses on one file into a
+ * "stop retrying" hint (Tier 2 #6).
  *
  * Kept from pi (deviations ledger #2/#3/#7/#8): LF pre-normalization with
  * BOM/CRLF restoration, `withFileMutationQueue`, constrained sampling, and the
@@ -19,6 +21,7 @@ import * as nodePath from "node:path";
 import { Type } from "typebox";
 import { withFileMutationQueue, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, splitBom } from "./text.js";
+import { recordPatchFailure, resetPatchFailures } from "./failure-tracker.js";
 import { runChain, type ChainFailure, type StrategyName } from "./chain.js";
 import { applyReplacements, maybeUnescapeNewString, unicodeEditPlan } from "./shaping.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
@@ -27,6 +30,8 @@ import {
 	ambiguityErrorMessage,
 	emptyOldStringError,
 	escapeDriftErrorMessage,
+	failureEscalationHint,
+	genericNoMatchHint,
 	identicalStringsError,
 	missingPathError,
 	missingReplacementError,
@@ -271,6 +276,32 @@ export type ReplacementOutcome =
 	| { ok: false; alreadyApplied?: boolean; errorMessage: string };
 
 /**
+ * hermes `file_tool`'s no-match escalation (file_tools.py:1025-1042), layered
+ * onto a failed replace call. Only plain no-match errors participate — the
+ * "Could not find" substring gate keeps ambiguity, escape-drift and
+ * replace_all refusals out (they explain themselves; hermes counts the same
+ * set). Recording is replace-mode-only here by construction: validateCall
+ * refuses every other mode before matching, and when V4A lands (Tier 3) its
+ * misses must keep bypassing this (hermes counts replace misses only —
+ * "V4A misses are rare", file_tools.py:1022). Failure #3 and beyond escalates
+ * to the "stop retrying" hint; below the threshold a generic `_hint` attaches
+ * whenever the error carries no richer "Did you mean" snippet. Per ledger #6
+ * the hint rides inside the message text (pi results have no JSON envelope).
+ *
+ * `trackerKey` is the RESOLVED path (hermes records per resolved path) while
+ * `displayPath` stays the model's own spelling (hermes echoes the raw arg).
+ */
+function attachNoMatchEscalation(errorMessage: string, trackerKey: string, displayPath: string): string {
+	if (!errorMessage.includes("Could not find")) return errorMessage;
+	const failureCount = recordPatchFailure(trackerKey);
+	if (failureCount >= 3) return `${errorMessage}\n\n${failureEscalationHint(failureCount, displayPath)}`;
+	if (!errorMessage.includes("Did you mean one of these sections?")) {
+		return `${errorMessage}\n\n${genericNoMatchHint()}`;
+	}
+	return errorMessage;
+}
+
+/**
  * Pure core shared by execute() and the TUI preview: validate, run the chain,
  * then shape and splice — hermes' `fuzzy_find_and_replace` and its
  * orchestrator tail in one pass over LF-normalized content.
@@ -367,16 +398,22 @@ export function createPatchToolDefinition(
 				if (!applied.ok) {
 					if (applied.alreadyApplied) {
 						// Success-shaped no-op: do not write, do not error — this is the
-						// single biggest small-model loop-breaker (analysis §4).
+						// single biggest small-model loop-breaker (analysis §4). hermes
+						// flows this result through its success branch, so it also
+						// clears the consecutive-miss count (file_tools.py:1020).
+						resetPatchFailures([absolutePath]);
 						return { content: [{ type: "text", text: applied.errorMessage }], details: undefined };
 					}
-					throw new Error(applied.errorMessage);
+					throw new Error(attachNoMatchEscalation(applied.errorMessage, absolutePath, path));
 				}
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(applied.newContent, originalEnding);
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
+				// Success resets the per-path consecutive-miss count so a future
+				// miss starts a fresh count (hermes `_reset_patch_failures`).
+				resetPatchFailures([absolutePath]);
 
 				const diffResult = generateDiffString(normalizedContent, applied.newContent);
 				const patch = generateUnifiedPatch(path, normalizedContent, applied.newContent);

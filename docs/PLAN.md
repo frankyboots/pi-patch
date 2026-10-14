@@ -99,6 +99,21 @@ Implemented so far:
       whole test corpus moved with it; the replace-mode error texts are now
       byte-exact Appendix B modulo pi tool names (ledger #10) — that closes most
       of Tier 2 #7, the rest rides on #6 and Tier 3.
+- [x] Tier 2 #6: failure counter + escalation (`src/failure-tracker.ts` —
+      hermes `_patch_failure_tracker`/`_record_patch_failure`/
+      `_reset_patch_failures` verbatim, including the 64-path cap with oldest
+      eviction; keyed by resolved path alone since pi has no task registry,
+      ledger #4). Only plain no-match errors count (hermes' "Could not find"
+      substring gate keeps ambiguity/escape-drift/replace_all refusals out),
+      recording is replace-mode-only by construction (validateCall refuses
+      every other mode; V4A misses must keep bypassing it when Tier 3 lands),
+      success — including the already-applied no-op, which flows through
+      hermes' success branch — resets the per-path streak, failure #3+ injects
+      the "stop retrying" escalation verbatim (`{path!r}` repr included,
+      `write_file`→`write` per ledger #10), and below the threshold the
+      generic `_hint` attaches whenever the error carries no "Did you mean"
+      snippet. Hints ride inside the message text (ledger #6). The TUI preview
+      deliberately never touches the tracker — only execute() counts.
 
 ## Build plan (exact-port tiers)
 
@@ -132,16 +147,16 @@ though V4A is now in scope.
       and tests to match. (`preparePatchArguments` flattens single-entry `edits[]` and pi
       spellings, refuses nothing; `validateCall` owns every gate. Multi-entry `edits[]` →
       ledger #14, unadvertised `mode`/`patch` → ledger #15.)
-- [ ] 6. Failure counter + escalation (session-scoped): per-path consecutive-miss count,
+- [x] 6. Failure counter + escalation (session-scoped): per-path consecutive-miss count,
       failure-#3 "stop retrying" hint, reset on success, and the generic below-threshold
       `_hint` whenever no richer "did you mean" snippet is attached (§4).
-- [ ] 7. Error-text fidelity: Appendix B texts verbatim, modulo tool-name mapping
-      (ledger #10). *Largely landed with #5:* replace-mode texts (ambiguity +
+- [x] 7. Error-text fidelity: Appendix B texts verbatim, modulo tool-name mapping
+      (ledger #10). *Replace mode is complete:* all texts (ambiguity +
       locations, replace_all refusal, no-match + hint + whitespace diagnosis,
       already-applied, escape-drift, empty/whitespace-only/identical, the arg
-      gates, `Unknown mode:`) are byte-exact and asserted verbatim in
-      `test/patch.test.ts`; what's left rides on #6 (generic `_hint`) and Tier 3
-      (patch-mode parse/validation texts).
+      gates, `Unknown mode:`, plus #6's escalation and generic `_hint`) are
+      byte-exact and asserted verbatim in `test/patch.test.ts`; what's left is
+      patch-mode parse/validation text, owned by Tier 3 #8/#9.
 
 ### Tier 3 — V4A patch mode
 

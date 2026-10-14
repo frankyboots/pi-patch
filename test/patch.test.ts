@@ -5,7 +5,7 @@
  * single-replacement surface (path + old_string + new_string + replace_all):
  * CRLF/BOM, already-applied no-op, argument normalization, hermes' arg gates.
  */
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -39,6 +39,7 @@ import {
 	unicodeEditPlan,
 } from "../src/shaping.js";
 import { detectEscapeDrift } from "../src/escape-drift.js";
+import { clearPatchFailures, recordPatchFailure, resetPatchFailures } from "../src/failure-tracker.js";
 import {
 	applyReplacement,
 	createPatchToolDefinition,
@@ -1261,6 +1262,171 @@ describe("tool: execute against real files", () => {
 		const { dir, file, name } = await tmpFile("abc\n");
 		await run({ path: name, old_string: "abc", new_string: "xyz", patch: "*** Begin Patch\n*** End Patch" }, dir);
 		expect(await fs.readFile(file, "utf-8")).toBe("xyz\n");
+	});
+});
+
+describe("tool: failure escalation (hermes _patch_failure_tracker, Tier 2 #6)", () => {
+	async function tmpFile(content: string): Promise<{ dir: string; file: string; name: string }> {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-escalate-"));
+		const file = path.join(dir, "sample.txt");
+		await fs.writeFile(file, content, "utf-8");
+		return { dir, file, name: "sample.txt" };
+	}
+
+	const tool = createPatchToolDefinition("/tmp");
+
+	async function run(input: object, cwd: string) {
+		return tool.execute("test-call", input as never, undefined, undefined, { cwd } as never);
+	}
+
+	async function runError(input: object, cwd: string): Promise<string> {
+		const error = await run(input, cwd).then(
+			() => undefined,
+			(e: unknown) => e,
+		);
+		expect(error).toBeInstanceOf(Error);
+		return error instanceof Error ? error.message : String(error);
+	}
+
+	// A no-match that still resembles a file line (≈0.7 anchor similarity —
+	// below context_aware's 0.80 bar, above the 0.30 suggestion floor): the
+	// error carries a "Did you mean" snippet, which suppresses the generic hint.
+	const SIMILAR = "def comput() {\n	return 7;\n}";
+	// A no-match with nothing above the 0.30 floor in the file: plain
+	// "Could not find…", so the below-threshold generic hint layer shows.
+	const DISSIMILAR = "qqq www eee";
+
+	beforeEach(() => clearPatchFailures());
+
+	it("escalates at failure #3 on the same path and keeps counting", async () => {
+		const { dir, name } = await tmpFile("function compute() {\n	return 7;\n}\n");
+		const call = { path: name, old_string: SIMILAR, new_string: "x" };
+		// Failures 1 and 2 stay below the threshold: did-you-mean only.
+		for (let i = 0; i < 2; i++) {
+			const message = await runError(call, dir);
+			expect(message).toContain("Did you mean one of these sections?");
+			expect(message).not.toContain("old_string not found.");
+			expect(message).not.toContain("This is failure #");
+		}
+		const third = await runError(call, dir);
+		expect(third).toContain("Did you mean one of these sections?");
+		expect(third.endsWith(
+			"\n\nThis is failure #3 patching 'sample.txt'. " +
+				"Stop retrying with variations of the same old_string. " +
+				"Either: (1) re-read the file fresh to verify current " +
+				"content, (2) use a longer / more unique old_string with " +
+				"surrounding context lines, or (3) use write to " +
+				"replace the entire file if the targeted region is hard " +
+				"to anchor.",
+		)).toBe(true);
+		expect(await runError(call, dir)).toContain("This is failure #4 patching 'sample.txt'.");
+	});
+
+	it("below the threshold, a no-match without a did-you-mean carries the generic hint", async () => {
+		const { dir, name } = await tmpFile("aaa bbb ccc\n");
+		const call = { path: name, old_string: DISSIMILAR, new_string: "x" };
+		const message = await runError(call, dir);
+		// hermes attaches `_hint` alongside the error; per ledger #6 it rides in
+		// the message text, so the whole text is byte-exact here.
+		expect(message).toBe(
+			"Could not find a match for old_string in the file\n\n" +
+				"old_string not found. Use read to verify the current content, or grep to locate the text.",
+		);
+	});
+
+	it("a success resets the consecutive count (hermes _reset_patch_failures)", async () => {
+		const { dir, file, name } = await tmpFile("aaa bbb ccc\n");
+		const miss = { path: name, old_string: DISSIMILAR, new_string: "x" };
+		await runError(miss, dir);
+		await runError(miss, dir);
+		await run({ path: name, old_string: "aaa", new_string: "AAA" }, dir);
+		expect(await fs.readFile(file, "utf-8")).toBe("AAA bbb ccc\n");
+		// Without the reset this miss would be failure #3 and escalate.
+		const message = await runError(miss, dir);
+		expect(message).toContain("old_string not found.");
+		expect(message).not.toContain("This is failure #");
+	});
+
+	it("the already-applied no-op resets the count too (hermes' success branch)", async () => {
+		// hermes' already-applied PatchResult is success=True with no error, so
+		// its handler resets the tracker exactly like a landed write.
+		const { dir, name } = await tmpFile("value = 42\n");
+		const miss = { path: name, old_string: DISSIMILAR, new_string: "x" };
+		await runError(miss, dir);
+		await runError(miss, dir);
+		const noop = await run({ path: name, old_string: "zzz = 41", new_string: "value = 42" }, dir);
+		expect(noop.content.map((c) => (c as { text: string }).text).join("")).toContain("already applied");
+		// Without the reset this miss would be failure #3 and escalate.
+		const message = await runError(miss, dir);
+		expect(message).toContain("old_string not found.");
+		expect(message).not.toContain("This is failure #");
+	});
+
+	it("ambiguity and escape-drift refusals are not counted (hermes counts 'Could not find' only)", async () => {
+		const { dir, name } = await tmpFile("aaa bbb ccc\ndup\ndup\n");
+		const miss = { path: name, old_string: DISSIMILAR, new_string: "x" };
+		await runError(miss, dir);
+		await runError(miss, dir);
+		// Ambiguity explains itself — no generic hint, no escalation, no count.
+		const ambiguous = await runError({ path: name, old_string: "dup", new_string: "x" }, dir);
+		expect(ambiguous).toContain("Found 2 matches for old_string");
+		expect(ambiguous).not.toContain("old_string not found.");
+		expect(ambiguous).not.toContain("This is failure #");
+		// If the ambiguity refusal had been counted, this would be failure #4.
+		expect(await runError(miss, dir)).toContain("This is failure #3 patching 'sample.txt'.");
+	});
+
+	it("escape-drift refusals are not counted either", async () => {
+		const { dir, name } = await tmpFile('def greet():\n    print("hi")\n');
+		const drift = {
+			path: name,
+			old_string: 'def greet():\\n    print("hi")',
+			new_string: 'def greet():\\n    print("hello")',
+		};
+		for (let i = 0; i < 2; i++) {
+			const message = await runError(drift, dir);
+			expect(message).toContain("Escape-drift detected");
+			expect(message).not.toContain("old_string not found.");
+			expect(message).not.toContain("This is failure #");
+		}
+		// The next no-match is only failure #1: drift calls never incremented.
+		const message = await runError({ path: name, old_string: SIMILAR, new_string: "x" }, dir);
+		expect(message).toContain("Did you mean one of these sections?");
+		expect(message).not.toContain("This is failure #");
+	});
+
+	it("different paths count independently", async () => {
+		const { dir, name } = await tmpFile("aaa bbb ccc\n");
+		const other = path.join(dir, "other.txt");
+		await fs.writeFile(other, "aaa bbb ccc\n", "utf-8");
+		const miss = { path: name, old_string: DISSIMILAR, new_string: "x" };
+		await runError(miss, dir);
+		await runError(miss, dir);
+		// other.txt has never failed: generic hint, not escalation.
+		const otherMessage = await runError({ path: "other.txt", old_string: DISSIMILAR, new_string: "x" }, dir);
+		expect(otherMessage).toContain("old_string not found.");
+		expect(otherMessage).not.toContain("This is failure #");
+		// sample.txt is still at streak #2 → this miss is its #3.
+		expect(await runError(miss, dir)).toContain("This is failure #3 patching 'sample.txt'.");
+	});
+});
+
+describe("failure-tracker: hermes _record_patch_failure units", () => {
+	beforeEach(() => clearPatchFailures());
+
+	it("evicts the oldest path beyond the 64-path cap", () => {
+		for (let i = 0; i < 64; i++) recordPatchFailure(`/f${i}`);
+		expect(recordPatchFailure("/f0")).toBe(2); // still tracked; update keeps its insertion age
+		recordPatchFailure("/f64"); // cap reached: /f0 — the oldest — is evicted
+		expect(recordPatchFailure("/f0")).toBe(1); // re-recorded fresh after eviction
+	});
+
+	it("reset clears only the given paths", () => {
+		recordPatchFailure("/a");
+		recordPatchFailure("/b");
+		resetPatchFailures(["/a"]);
+		expect(recordPatchFailure("/a")).toBe(1);
+		expect(recordPatchFailure("/b")).toBe(2);
 	});
 });
 

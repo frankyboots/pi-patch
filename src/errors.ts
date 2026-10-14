@@ -228,6 +228,33 @@ export function alreadyAppliedMessage(path: string): string {
 	);
 }
 
+/**
+ * hermes `file_tool`'s below-threshold `_hint` (file_tools.py:1039): attached
+ * when a plain no-match error carries no richer "Did you mean" snippet.
+ * Tool names mapped per ledger #10 (`read_file`→`read`, `search_files`→`grep`).
+ */
+export function genericNoMatchHint(): string {
+	return "old_string not found. Use read to verify the current content, or grep to locate the text.";
+}
+
+/**
+ * hermes `file_tool`'s escalation `_hint` (file_tools.py:1030): the per-path
+ * consecutive-miss tracker has tripped (failure #3 and beyond); tell the model
+ * to stop retrying variations of the same old_string. `{path!r}` keeps hermes'
+ * repr formatting; `write_file` maps to pi's `write` (ledger #10).
+ */
+export function failureEscalationHint(failureCount: number, path: string): string {
+	return (
+		`This is failure #${failureCount} patching ${pyRepr(path)}. ` +
+		"Stop retrying with variations of the same old_string. " +
+		"Either: (1) re-read the file fresh to verify current " +
+		"content, (2) use a longer / more unique old_string with " +
+		"surrounding context lines, or (3) use write to " +
+		"replace the entire file if the targeted region is hard " +
+		"to anchor."
+	);
+}
+
 /** hermes `patch_tool` argument gates (verbatim `tool_error` texts). */
 export function missingPathError(): string {
 	return "path required";
