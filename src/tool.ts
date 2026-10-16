@@ -307,7 +307,7 @@ function validateCall(input: PatchToolInput): ValidatedCall {
 export function resolveToCwd(filePath: string, cwd: string): string {
 	if (filePath.startsWith("~")) {
 		const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-		if (home) return nodePath.resolve(home, filePath.slice(1));
+		if (home) return nodePath.join(home, filePath.slice(1));
 	}
 	return nodePath.isAbsolute(filePath) ? nodePath.normalize(filePath) : nodePath.resolve(cwd, filePath);
 }

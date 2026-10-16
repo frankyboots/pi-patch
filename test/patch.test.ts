@@ -6,7 +6,7 @@
  * CRLF/BOM, already-applied no-op, argument normalization, hermes' arg gates —
  * and the V4A patch mode (test_patch_parser.py corpora, Tier 3 #8).
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -76,6 +76,7 @@ import {
 	computePatchDiff,
 	createPatchToolDefinition,
 	preparePatchArguments,
+	resolveToCwd,
 } from "../src/tool.js";
 import {
 	emptyOldStringError,
@@ -1312,6 +1313,42 @@ describe("tool: preparePatchArguments (schema_sanitizer analog, ledger #8)", () 
 	});
 });
 
+describe("tool: resolveToCwd (~ expansion)", () => {
+	const originalHome = process.env.HOME;
+	afterEach(() => {
+		process.env.HOME = originalHome;
+	});
+
+	it("resolves ~/sub/dir against $HOME (regression: path.resolve dropped $HOME on the leading /)", () => {
+		process.env.HOME = "/home/fake";
+		expect(resolveToCwd("~/sub/dir", "/tmp")).toBe("/home/fake/sub/dir");
+	});
+
+	it("resolves bare ~ to $HOME", () => {
+		process.env.HOME = "/home/fake";
+		expect(resolveToCwd("~", "/tmp")).toBe("/home/fake");
+	});
+
+	it("leaves absolute and relative paths untouched", () => {
+		process.env.HOME = "/home/fake";
+		expect(resolveToCwd("/etc/hosts", "/tmp")).toBe("/etc/hosts");
+		expect(resolveToCwd("sub/dir", "/tmp")).toBe("/tmp/sub/dir");
+	});
+
+	it("falls back to cwd resolution when no home env is available", () => {
+		const home = process.env.HOME;
+		const userProfile = process.env.USERPROFILE;
+		delete process.env.HOME;
+		delete process.env.USERPROFILE;
+		try {
+			expect(resolveToCwd("~/sub/dir", "/tmp")).toBe("/tmp/~/sub/dir");
+		} finally {
+			if (home !== undefined) process.env.HOME = home;
+			if (userProfile !== undefined) process.env.USERPROFILE = userProfile;
+		}
+	});
+});
+
 describe("tool: execute against real files", () => {
 	async function tmpFile(content: string): Promise<{ dir: string; file: string; name: string }> {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-"));
@@ -1338,6 +1375,23 @@ describe("tool: execute against real files", () => {
 		expect(text).toContain("Successfully replaced 1 block(s)");
 		expect(text).toContain("---"); // unified patch in model-facing content
 		expect(res.details?.firstChangedLine).toBe(2);
+	});
+
+	it("resolves a ~/ path against $HOME and writes there (regression: ~/folder went to /, forcing full paths)", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "pi-patch-home-"));
+		const homeFile = path.join(home, "sample.txt");
+		await fs.writeFile(homeFile, "one\ntwo\n");
+		const savedHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			const res = await run({ path: "~/sample.txt", old_string: "two", new_string: "TWO" }, "/tmp");
+			expect(await fs.readFile(homeFile, "utf-8")).toBe("one\nTWO\n");
+			const text = res.content.map((c) => (c as { text: string }).text).join("");
+			expect(text).toContain(homeFile);
+		} finally {
+			process.env.HOME = savedHome;
+			await fs.rm(home, { recursive: true, force: true });
+		}
 	});
 
 	it("accepts a pi-shaped call (edits[] with one entry, camelCase names)", async () => {
