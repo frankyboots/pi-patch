@@ -18,11 +18,15 @@ validation bar, and the **deviations ledger** — every place we intentionally d
 hermes must have a row there. Read both before changing matching behavior or error formats —
 the README's comparison table summarizes the intent.
 
-**This repo dogfoods the extension**: `.pi/extensions/pi-patch.ts` loads it for every pi
-session started here, so agents have `patch` available by default (alongside `edit`).
-That loader is a thin re-export of `src/index.ts` — never put implementation there; `src/`
-is the single source of truth. Agents are expected to actually *use* it — see the
-dogfooding policy below.
+**This repo dogfoods the extension**: on this box `pi` loads `src/index.ts` for every
+session via the global packages entry `../../pi-patch/src/index.ts` in
+`~/.pi/agent/settings.json` (a machine-local install pointing at this repo's source), so
+agents have `patch` available by default (alongside `edit`). There is deliberately **no**
+project-level `.pi/extensions` loader: it would register the same tool under a second
+extension path, and pi's resource loader reports that as a `Tool "patch" conflicts with …`
+startup error. To dogfood from a fresh clone, add the same packages entry — or run
+`pi --extension <path>/src/index.ts`. Agents are expected to actually *use* the tool —
+see the dogfooding policy below.
 
 ## Dogfooding policy — `patch` is the daily driver
 

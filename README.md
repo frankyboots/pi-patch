@@ -56,10 +56,11 @@ built-in `edit` keeps multi-edit batching available.
 npm install          # dev deps for tests/typecheck
 ```
 
-**In this project, agents get `patch` by default**: `.pi/extensions/pi-patch.ts` loads the
-extension (from `src/`) for every pi session started here. pi asks for **project trust once**
-(`.pi/extensions` triggers it); after that the tool is just there — the system prompt carries
-the `patch` guidelines next to `edit`'s.
+**In this project, agents get `patch` by default**: on this box `pi` loads `src/index.ts`
+for every session via a global packages entry in `~/.pi/agent/settings.json` (a
+machine-local install pointing at this repo). A project-level `.pi/extensions` loader is
+deliberately **not** committed: registering the tool from both a global and a project
+extension makes pi report a `Tool "patch" conflicts with …` error at startup.
 
 Run directly from anywhere else in development:
 
