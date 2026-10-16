@@ -197,6 +197,22 @@ function fuzzyReplace(
 	return { ok: true, out, count: r.match.spans.length, strategy: r.match.strategy };
 }
 
+// This VM's clocksource (kvm-clock) resolves inode timestamps to ~1ms, so a
+// same-size rewrite landing inside the read stamp's millisecond leaves hermes'
+// (dev, ino, size, mtime_ns, ctime_ns) tuple byte-identical and `drifted()`
+// correctly reports no change — drift tests then flake on which millisecond
+// they land in (2026-10-17: 5–6 staleness tests red per run). Force the
+// "external" writer's mtime forward so the tuple is guaranteed to differ
+// regardless of clock granularity.
+// The bump is strictly increasing ACROSS CALLS: `Date.now()` may not tick
+// between the test's writes (a suite step lands inside one millisecond), so
+// each call must push the mtime past every earlier stamp, not just "now".
+let mtimeBump = Date.now() + 5000;
+function advanceMtime(file: string): void {
+	mtimeBump += 1000;
+	utimesSync(file, new Date(mtimeBump), new Date(mtimeBump));
+}
+
 describe("corpus: TestWhitespaceDifference (hermes)", () => {
 	it("test_extra_spaces_match", () => {
 		const r = fuzzyReplace("def  foo(  x,  y  ):", "def foo( x, y ):", "def bar(x, y):");
@@ -2190,7 +2206,8 @@ describe("staleness: read-time version capture + edit-time warning (hermes _chec
 	it("a failed patch carries the warning too and leaves the stale stamp in place", async () => {
 		const { dir, file, name } = await tmpFile("alpha\nbeta\n");
 		noteRead(file);
-		writeFileSync(file, "alpha\nBETA\n");
+		writeFileSync(file, "alpha\nBETA\n"); // same size: coarse clock might not see it
+		advanceMtime(file);
 		const message = await errorOf({ path: name, old_string: "nothing like this at all", new_string: "x" }, dir);
 		expect(message).toContain("Could not find a match for old_string");
 		expect(message.endsWith(`\n\n${staleFileWarning(name)}`)).toBe(true);
@@ -2208,6 +2225,9 @@ describe("staleness: read-time version capture + edit-time warning (hermes _chec
 		noteRead(file);
 		const before = statSync(file);
 		const mtimeMs = Math.floor(before.mtimeMs);
+		// let the coarse clock (~1ms here) tick so the strict ctime comparison
+		// below is deterministic; `utimes` stamps ctime with "now"
+		await new Promise((r) => setTimeout(r, 10));
 		rmSync(file);
 		writeFileSync(file, "same bytes\n");
 		utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
@@ -2226,7 +2246,8 @@ describe("staleness: read-time version capture + edit-time warning (hermes _chec
 	it("noteWrite (pi's edit/write results) clears an external-change warning", async () => {
 		const { file } = await tmpFile("a\nb\n");
 		noteRead(file);
-		writeFileSync(file, "a\nB\n");
+		writeFileSync(file, "a\nB\n"); // same size: coarse clock might not see it
+		advanceMtime(file);
 		expect(drifted(file)).toBe(true);
 		// pi's built-in `edit`/`write` just rewrote it: hermes would have stamped
 		// the write in `_note_edited`, and so does the event handler.
@@ -2288,8 +2309,10 @@ describe("staleness: read-time version capture + edit-time warning (hermes _chec
 		await fs.writeFile(path.join(dir, "b.txt"), "three\nfour\n", "utf-8");
 		noteRead(path.join(dir, "a.txt"));
 		noteRead(path.join(dir, "b.txt"));
-		writeFileSync(path.join(dir, "a.txt"), "one\nTWO\n");
-		writeFileSync(path.join(dir, "b.txt"), "three\nFOUR\n");
+		writeFileSync(path.join(dir, "a.txt"), "one\nTWO\n"); // same size: coarse clock might not see it
+		advanceMtime(path.join(dir, "a.txt"));
+		writeFileSync(path.join(dir, "b.txt"), "three\nFOUR\n"); // same size: coarse clock might not see it
+		advanceMtime(path.join(dir, "b.txt"));
 		const result = await run(
 			{
 				mode: "patch",
@@ -2327,7 +2350,8 @@ describe("staleness: read-time version capture + edit-time warning (hermes _chec
 		const file = path.join(dir, "a.txt");
 		await fs.writeFile(file, "one\ntwo\n", "utf-8");
 		noteRead(file);
-		writeFileSync(file, "one\nTWO\n");
+		writeFileSync(file, "one\nTWO\n"); // same size: coarse clock might not see it
+		advanceMtime(file);
 		const message = await errorOf(
 			{
 				mode: "patch",
@@ -2363,7 +2387,8 @@ describe("extension wiring: tool_result stamps the versions (Tier 4 #12, ledger 
 			{ toolName: "read", isError: false, input: { path: "sample.txt" } } as never,
 			{ cwd: dir } as never,
 		);
-		writeFileSync(file, "a\nB\n");
+		writeFileSync(file, "a\nB\n"); // same size: coarse clock might not see it
+		advanceMtime(file);
 		expect(drifted(file)).toBe(true);
 		// pi's `edit` rewrote it — a write is an implicit read (hermes _note_edited)
 		toolResult!(
@@ -2373,7 +2398,8 @@ describe("extension wiring: tool_result stamps the versions (Tier 4 #12, ledger 
 		expect(drifted(file)).toBe(false);
 		// a failed read saw nothing; `grep` never stamped in hermes; `patch`
 		// stamps inside its own execute
-		writeFileSync(file, "a\nC\n");
+		writeFileSync(file, "a\nC\n"); // same size: coarse clock might not see it
+		advanceMtime(file);
 		toolResult!({ toolName: "read", isError: true, input: { path: "sample.txt" } } as never, { cwd: dir } as never);
 		expect(drifted(file)).toBe(true);
 		toolResult!({ toolName: "grep", isError: false, input: { path: "sample.txt" } } as never, { cwd: dir } as never);
