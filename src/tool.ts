@@ -43,7 +43,7 @@ import { noteWrite, stalenessWarnings } from "./staleness.js";
 import { editFormatGuideline } from "./edit-guidance.js";
 import { fuzzyFindAndReplace, isAlreadyApplied, type StrategyName } from "./chain.js";
 import { generateDiffString, generateUnifiedPatch } from "./diff-utils.js";
-import { applyV4APatch } from "./v4a.js";
+import { applyV4APatch, parseV4APatch } from "./v4a.js";
 import { verifyPatchPersisted, verifyWrittenHash } from "./verify.js";
 import { collectV4AHeaderPaths, createHostV4AFileOps, rewriteV4APatchPathsForHost, withSortedMutationQueue } from "./v4a-fs.js";
 import {
@@ -459,10 +459,33 @@ async function executeV4ACall(patchArg: string, cwd: string, throwIfAborted: () 
 		// PREVIOUS stamp — hermes' `getmtime` fails there too, so nothing is
 		// refreshed (and an unstattable path never warns anyway).
 		for (const resolved of pathToResolved.values()) noteWrite(resolved);
+		// hermes reads a V4A patch only up to the FIRST `*** End Patch`
+		// (`parse_v4a_patch` breaks there — its own tests pin that later blocks are
+		// parsed nowhere), while this payload reports hermes' `_paths_to_check`: every
+		// path the HEADERS name. A patch mistakenly closed with one End Patch per file
+		// therefore wrote one file and listed all of them, which is how silent
+		// truncation reads as success. Keep hermes' payload and say what was skipped
+		// (deviations ledger #21).
+		const applied = new Set<string>();
+		for (const op of parseV4APatch(hostPatch).operations) {
+			applied.add(op.filePath);
+			if (op.newPath) applied.add(op.newPath);
+		}
+		const skipped = [...new Set(collected.all.map((raw) => pathToResolved.get(raw) ?? raw))].filter(
+			(resolved) => !applied.has(resolved),
+		);
 		const filesModified = collected.all.map((raw) => pathToEntry.get(raw) ?? pathToResolved.get(raw) ?? raw);
 		const summary = ["Successfully applied V4A patch.", "", `files_modified: ${filesModified.join(", ")}`];
 		if (result.filesCreated.length > 0) summary.push(`files_created: ${result.filesCreated.join(", ")}`);
 		if (result.filesDeleted.length > 0) summary.push(`files_deleted: ${result.filesDeleted.join(", ")}`);
+		if (skipped.length > 0) {
+			summary.push(
+				`note: ${skipped.length} header path${skipped.length === 1 ? " was" : "s were"} NOT touched — no ` +
+					`operation in the parsed patch named ${skipped.join(", ")}. A V4A patch ends at the FIRST ` +
+					`"*** End Patch"; put one at the very end of the patch (not one per file) and re-send the ` +
+					`skipped blocks.`,
+			);
+		}
 		if (filesModified.length === 1) summary.push(`resolved_path: ${filesModified[0]}`);
 		return {
 			content: [

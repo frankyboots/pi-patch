@@ -1721,6 +1721,53 @@ describe("tool: V4A execute against real files (Tier 3 #10)", () => {
 		expect((result.details as { diff: string }).diff).toContain(`--- a/${path.join(dir, "a.txt")}`);
 	});
 
+	it("flags header paths no operation applied (dogfood: per-file End Patch truncation)", async () => {
+		// One `*** End Patch` per file is a natural mis-authoring. hermes terminates a
+		// V4A patch at the FIRST End marker (its own tests pin that later blocks parse
+		// nowhere), and the payload reports hermes' `_paths_to_check` — every path the
+		// HEADERS name — so a truncated run used to list three files after writing one.
+		const dir = await tmpDir();
+		await fs.writeFile(path.join(dir, "a.txt"), "alpha\n", "utf-8");
+		const text = textOf(
+			await run(
+				[
+					"*** Begin Patch",
+					"*** Update File: a.txt",
+					"@@",
+					"-alpha",
+					"+ALPHA",
+					"*** End Patch",
+					"*** Add File: b.txt",
+					"+bravo",
+					"*** End Patch",
+					"*** Add File: c.txt",
+					"+charlie",
+					"*** End Patch",
+				].join("\n"),
+				dir,
+			),
+		);
+		expect(await fs.readFile(path.join(dir, "a.txt"), "utf-8")).toBe("ALPHA\n");
+		// The truncated blocks never parsed, so nothing they named was created.
+		await expect(fs.readFile(path.join(dir, "b.txt"), "utf-8")).rejects.toThrow();
+		await expect(fs.readFile(path.join(dir, "c.txt"), "utf-8")).rejects.toThrow();
+		// hermes' header-derived payload stands…
+		expect(text).toContain(
+			`files_modified: ${[path.join(dir, "a.txt"), path.join(dir, "b.txt"), path.join(dir, "c.txt")].join(", ")}`,
+		);
+		// …but the success result now says out loud that two of them never happened.
+		expect(text).toMatch(/note: 2 header paths were NOT touched — no operation[\s\S]*End Patch/);
+		// A correctly authored patch (ONE End Patch at the end) stays silent.
+		const good = textOf(
+			await run(
+				["*** Begin Patch", "*** Update File: a.txt", "@@", "-ALPHA", "+Alpha", "*** Add File: b.txt", "+bravo", "*** End Patch"].join("\n"),
+				dir,
+			),
+		);
+		expect(good).not.toContain("NOT touched");
+		expect(await fs.readFile(path.join(dir, "b.txt"), "utf-8")).toBe("bravo");
+	});
+
 	it("single-file patches carry resolved_path", async () => {
 		const dir = await tmpDir();
 		await fs.writeFile(path.join(dir, "solo.txt"), "alpha\n", "utf-8");
