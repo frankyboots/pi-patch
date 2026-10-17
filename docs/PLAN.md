@@ -328,7 +328,14 @@ though V4A is now in scope.
       mtime) → staleness warning at edit time. (`src/staleness.ts` + the
       `tool_result` wiring in `src/index.ts`; see the Tier 4 #12 status entry and
       ledger #19/#20.)
-- [ ] 13. Strategy telemetry (JSONL) driving threshold tuning on our traffic.
+- [ ] 13. Strategy telemetry (JSONL) over daily workloads: accumulate a large corpus of
+      ordinary work (every project, every machine) and tune the chain's thresholds on that
+      traffic rather than on hermes'. Not a retirement justification — `edit` is already
+      withdrawn, and the observational snapshot (docs/BASELINE.md) is small-n with V4A
+      nearly unexercised (3 non-harness V4A calls in 3 months). Metrics to keep watching as
+      the corpus grows: failed calls, wasted calls per landed edit, abandoned targets,
+      wrong-landing proxy, no-match share per strategy, and V4A adoption (V4A calls per 100
+      edit-engine calls — models currently prefer back-to-back single-replacement calls).
 - [ ] 14. Lint/LSP delta in the result — blocked in pi today (ledger #5); revisit if pi
       grows a public harness.
 
@@ -347,7 +354,10 @@ argument normalization. Everything else follows hermes.
   escape-drift).
 - A/B on small local models (pi's llama.cpp provider path): metrics = edit success per call,
   retries per landed edit, turns per successful edit session, corruption incidents (must
-  remain zero).
+  remain zero). The observational baseline (`scripts/session_baseline.py --json` per
+  machine, merged by `scripts/aggregate_baseline.py`) bounds this claim but cannot replace
+  it: the agent chose the tool, the arms mostly live on different machines, and after the
+  withdrawal there is no counterfactual — #13's telemetry is the forward-looking evidence.
 
 ## Complexity & risk (implementation guidance)
 

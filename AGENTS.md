@@ -18,31 +18,34 @@ validation bar, and the **deviations ledger** — every place we intentionally d
 hermes must have a row there. Read both before changing matching behavior or error formats —
 the README's comparison table summarizes the intent.
 
-**This repo dogfoods the extension**: on this box `pi` loads `src/index.ts` for every
+**This repo runs on its own extension**: on this box `pi` loads `src/index.ts` for every
 session via the global packages entry `../../pi-patch/src/index.ts` in
 `~/.pi/agent/settings.json` (a machine-local install pointing at this repo's source), so
-agents have `patch` available by default (in place of `edit`). There is deliberately **no**
-project-level `.pi/extensions` loader: it would register the same tool under a second
+every agent on this box edits with `patch` — including while changing `patch` itself.
+There is deliberately **no** project-level `.pi/extensions` loader: it would register the
+same tool under a second
 extension path, and pi's resource loader reports that as a `Tool "patch" conflicts with …`
-startup error. To dogfood from a fresh clone, add the same packages entry — or run
+startup error. To run the port from a fresh clone, add the same packages entry — or run
 `pi --extension <path>/src/index.ts`. Agents are expected to actually *use* the tool —
-see the dogfooding policy below.
+see the editing policy below.
 
-## Dogfooding policy — `patch` is the daily driver
+## Editing policy — `patch` is the daily driver
 
-`patch` is the sole editing tool (`edit` is withdrawn by this extension). When working in
-this repo, use **`patch`** for all file edits. The `write` tool is still available for
-creating new files.
+`edit` is withdrawn by this extension, so `patch` is the only editing tool in scope; the
+`write` tool stays available for new files. This is no longer an experiment being run — it
+is simply how work gets done here. The measurement lives in the telemetry work (PLAN Tier 4
+#13) and in [docs/BASELINE.md](docs/BASELINE.md), not in a policy.
 
 - **If `patch` fails or misbehaves — wrong match, wrong shaping, spurious ambiguity,
   unhelpful error, render glitch — log it** in [docs/DOGFOOD.md](docs/DOGFOOD.md): what you
   attempted, the error or wrong result verbatim, expected vs actual, and the strategy you
-  expected to match. Then carry on with whatever tool completes the job.
+  expected to match. Then finish the job — `write` the file if the engine genuinely cannot
+  land it, and say so in the log row.
 - **Diagnose before you log.** A miss is usually *your* context, not the engine: after a
   session compaction, the file copy in your head may be a summary of what you meant to write,
   not what is on disk — re-read the target (or trust the `file has: …` lines in the error)
   before filing a `patch` bug.
-- **Fixed dogfood bugs become regression tests** in `test/patch.test.ts`, named after the
+- **Fixed engine bugs become regression tests** in `test/patch.test.ts`, named after the
   failure mode (see Testing notes).
 
 ## Commands
@@ -112,6 +115,12 @@ test/golden/     generated golden corpus — reference outputs from the hermes
 scripts/         generate_span_map_golden.py — regenerates test/golden against
                  ~/.hermes/hermes-agent (override checkout with HERMES_HOME,
                  fuzz seed with GOLDEN_SEED); requires python3 but tests don't
+                 session_baseline.py — mines ~/.pi/agent/sessions for the historical
+                 edit-vs-patch evidence in docs/BASELINE.md (read-only; --json dumps
+                 per-call records, --failures prints verbatim failure texts)
+                 aggregate_baseline.py — merges session_baseline.py --json dumps from
+                 several machines (stratified Fisher/CMH stats per machine; --markdown
+                 emits the tables that live in docs/BASELINE.md)
 ```
 
 ## Architecture & invariants

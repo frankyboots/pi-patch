@@ -2,3 +2,11 @@ node_modules/
 *.log
 .DS_Store
 dist/
+
+# Machine dumps for scripts/aggregate_baseline.py — derived from session
+# transcripts (they embed prompt/response content). Never commit these.
+*.jsonl
+*.jsonl.gz
+desktop.json
+server.json
+trading.json

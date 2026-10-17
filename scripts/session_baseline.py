@@ -388,12 +388,16 @@ def report(records: list[dict], files: int, args) -> None:
 		      f" {sum(1 for r in rows if r['kind'] == 'already_applied'):>6}"
 		      f" {len({r['session'] for r in rows}):>9} {len({r['path'] for r in rows}):>7}")
 
-	for title, group_of, limit in (
+	cuts = [
 		("by model", lambda r: r["model"], 12),
 		("by work shape (edit/edits[] is a different capability)", lambda r: r["shape"], 8),
 		("by project", lambda r: os.path.basename(r["cwd"] or "?"), 10),
 		("by day", lambda r: (r["ts"] or "?")[:10], 14),
-	):
+	]
+	if any(r.get("location") for r in edits):
+		# Records merged by scripts/aggregate_baseline.py carry the dump they came from.
+		cuts.insert(0, ("by machine", lambda r: r.get("location"), 12))
+	for title, group_of, limit in cuts:
 		print()
 		print(f"--- {title} " + "-" * max(0, 72 - len(title)))
 		groups = collections.defaultdict(lambda: collections.defaultdict(list))

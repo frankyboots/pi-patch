@@ -18,6 +18,34 @@ tolerance chain) or informed second attempts (errors that show the closest secti
 locations, and the whitespace diff). This extension ports that tool — exactly, including its
 dual-mode surface — onto pi.
 
+## Evidence so far (and its limits)
+
+Mined from real session transcripts on three machines, 2026-07 → 2026-10, 1 153 real
+edit-engine calls: **9.7 % of `edit` calls fail (85/875) vs 4.0 % of `patch` calls
+(11/278)**, with the failure mix shifting away from "could not find" toward nothing at all.
+The metrics that must not move stayed at zero on both engines: no wrong landings, no
+escape-drift, no write-verification or staleness damage.
+
+Small print that matters:
+
+- **n is small and the arms are not interchangeable.** The clean same-machine contrast is
+  12.6 % (143 calls) vs 4.6 % (197 calls); most `edit` volume comes from boxes where
+  `patch` never ran, so the pooled figure still carries machine identity. Observational, not
+  an A/B — the agent chose the tool.
+- **V4A patch mode is essentially unexercised.** Three non-harness V4A calls in three
+  months. Models reaching for multi-file work do **not** use it: they batch back-to-back
+  single-replacement calls (on this box, 65 of 197 `patch` calls were consecutive singles
+  spanning 2–5 files, 64 of them landed). That is a fine outcome, but V4A's real ergonomics
+  and failure modes remain unmeasured. It looks promising; it is not proven.
+- **Measurement continues.** The remaining telemetry work (PLAN Tier 4 #13) is about building
+  a large corpus of *ordinary* daily work and tuning thresholds on our own traffic rather
+  than hermes' — not a one-off comparison. Reproduce: `scripts/session_baseline.py --json`
+  per machine, then `scripts/aggregate_baseline.py` ([docs/BASELINE.md](docs/BASELINE.md)).
+
+Other pi extensions ship editing tools. This one is a fidelity port of hermes' `patch`, kept
+as a daily driver and as a reference for what tolerant matching plus teaching errors look
+like on pi.
+
 ## What `patch` does differently from `edit`
 
 | | `edit` (built-in) | `patch` (this extension) |
@@ -74,7 +102,10 @@ aliased by pi itself).
 
 ## Try it
 
-Give the model the same edit both ways:
+Give the model the same edit both ways. `edit` is withdrawn whenever *this* extension is
+loaded, so run the comparison in a session without it (`pi -ne` / `--no-extensions`, or a
+machine without the packages entry), or restore `edit` by deleting the hidden
+re-registration block — `docs/PLAN.md` ledger #1 documents the switch.
 
 - `edit` a line but with the indentation you *remembered* (wrong) → terse failure.
 - `patch` the same wrong-indentation `old_string` → matches (line-trimmed tolerance), the
@@ -105,8 +136,10 @@ veto, sorted mutation queueing, absolute `files_modified`), plus operational par
 post-write verification (`src/verify.ts`, Tier 4 #11 — hermes' sha256 re-hash +
 full re-read persistence gates) and read-time version stamps with edit-time
 staleness warnings (`src/staleness.ts`, Tier 4 #12 — hermes' `_edit_warnings`
-gate, warn-only, fed from pi's `tool_result` events). Remaining: strategy
-telemetry (Tier 4 #13).
+gate, warn-only, fed from pi's `tool_result` events). Remaining: strategy telemetry over our
+daily workloads (Tier 4 #13 — accumulate a large corpus of ordinary work in JSONL, then tune
+the chain's thresholds on that traffic; the observational baseline in
+[docs/BASELINE.md](docs/BASELINE.md) is the starting point, not the finish line).
 
 ## Development
 

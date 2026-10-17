@@ -1,12 +1,14 @@
-# DOGFOOD log — bugs found while using `patch` as the daily driver
+# Engine bug log — `patch` misbehavior observed in real sessions
 
-Agent-facing record of `patch` misbehavior observed during real sessions in this repo
-(see the dogfooding policy in [AGENTS.md](../AGENTS.md)). This is **not** the deviations
-ledger — that one ([PLAN.md](PLAN.md)) records intentional departures from hermes; this one
-records places where `patch` did something we consider a *bug*.
+Agent-facing record of `patch` misbehavior observed while using it as the daily driver in
+this repo (see the editing policy in [AGENTS.md](../AGENTS.md)). The file keeps its
+`DOGFOOD.md` name, and the tests it generated keep their `dogfood:` names, for history's
+sake. This is **not** the deviations ledger — that one ([PLAN.md](PLAN.md)) records
+intentional departures from hermes; this one records places where `patch` did something we
+consider a *bug*.
 
-One row per bug, newest last. Log even if you had to switch to `edit` to finish — the log
-is how these become chain fixes and regression tests.
+One row per bug, newest last. Log even if `write` had to finish the job — the log is how
+these become chain fixes and regression tests.
 
 | Date | Context | Attempted | Result (verbatim error / wrong output) | Expected | Status |
 | ---- | ------- | --------- | -------------------------------------- | -------- | ------ |
