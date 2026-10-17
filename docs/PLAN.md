@@ -380,7 +380,7 @@ first.
 
 | # | Deviation | Kind | Rationale |
 |---|---|---|---|
-| 1 | Tool registered as `patch` alongside the built-in `edit` (not replacing it) | deliberate | this project's reason to exist: A/B the two engines in one session; hermes has no built-in twin to preserve |
+| 1 | Built-in `edit` tool withdrawn via `exposure: "hidden"` re-registration; `patch` is the sole editing tool | deliberate (revised 2026-11) | side-by-side coexistence retired; pi-patch supersedes `edit` with hermes' 9-strategy tolerant matching. Delete the `registerTool({ name: "edit", exposure: "hidden" })` block in `src/index.ts` to restore A/B coexistence |
 | 2 | LF pre-normalization before matching; hermes matches raw bytes (CRLF included) | deliberate improvement | models emit bare-LF anchors; hermes loses strategies 1/3/4/6 on CRLF files; we match everywhere and restore endings on write (§3.3). Consequence: a literal-`\r` anchor (strategy 5) loses its target byte after normalization and on CRLF files falls through to the similarity rungs instead |
 | 3 | `withFileMutationQueue` instead of hermes' `FileStateRegistry` locks | environment-forced | pi's public plumbing; same per-path serialization guarantee |
 | 4 | No `task_id`/`cross_profile` and none of `_write_precheck_error`'s gates (sensitive-path denylist, binary-document guard, protected-instruction guard, approval gate, mirror guard) | environment-forced | pi handles approval and workspace policy outside tools; there is no task registry to key state on. Revisit only if pi grows an equivalent policy layer |

@@ -2,9 +2,9 @@
 
 A [pi](https://github.com/earendil-works/pi) extension that registers a **`patch`** tool — an
 **exact port of the hermes `patch` tool** (dual-mode: fuzzy replace + V4A `apply_patch`),
-with tolerant 9-strategy matching, teaching errors, and a model-facing diff. It runs
-**alongside** the built-in `edit` (never instead of it), so you can A/B the two matching
-engines in the same session without hindering abilities.
+with tolerant 9-strategy matching, teaching errors, and a model-facing diff. It **replaces**
+the built-in `edit` tool (withdrawn via `exposure: "hidden"` re-registration), so `patch`
+is the sole editing tool in sessions where this extension is loaded.
 
 Background and the full analysis: [docs/EDIT-TOOL-ANALYSIS.md](docs/EDIT-TOOL-ANALYSIS.md).
 Build plan, current status, and the deviations ledger: [docs/PLAN.md](docs/PLAN.md).
@@ -47,8 +47,8 @@ others toward replace with V4A for genuinely multi-file work — regardless of t
 (ledger #17).
 Models trained on `edit` are still understood — `preparePatchArguments` maps
 `oldText`/`newText`/`replaceAll`/`file_path` and a single-entry `edits[]` onto hermes' names —
-but a call asking for several replacements is refused, never half-applied (ledger #14). The
-built-in `edit` keeps multi-edit batching available.
+but a call asking for several replacements is refused, never half-applied (ledger #14).
+Multi-hunk/multi-file edits go through V4A (`mode: "patch"`).
 
 ## Install
 

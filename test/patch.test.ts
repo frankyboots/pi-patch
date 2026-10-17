@@ -2367,6 +2367,20 @@ describe("staleness: read-time version capture + edit-time warning (hermes _chec
 });
 
 describe("extension wiring: tool_result stamps the versions (Tier 4 #12, ledger #19)", () => {
+	it("withdraws the built-in edit tool via exposure: hidden (ledger #1 revised)", async () => {
+		const { default: piPatchExtension } = await import("../src/index.js");
+		const registered: Array<{ name: string; exposure?: string }> = [];
+		piPatchExtension({
+			registerTool: (tool: { name: string; exposure?: string }) => {
+				registered.push({ name: tool.name, exposure: tool.exposure });
+			},
+			on: () => undefined,
+		} as never);
+		const editEntry = registered.find((t) => t.name === "edit");
+		expect(editEntry).toBeDefined();
+		expect(editEntry!.exposure).toBe("hidden");
+	});
+
 	it("stamps successful read/edit/write results, keyed the way patch resolves them", async () => {
 		clearReadStamps();
 		const { default: piPatchExtension } = await import("../src/index.js");

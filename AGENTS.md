@@ -7,9 +7,9 @@ Guidance for AI coding agents working in this repository.
 **pi-patch** is a [pi](https://github.com/earendil-works/pi) extension that registers a
 **`patch`** tool — an **exact port of the hermes `patch` tool**: same dual-mode surface
 (`replace` + V4A `apply_patch`, analysis §2.1), same 9-strategy tolerant matching chain,
-same teaching errors, same model-facing diff. It runs **alongside** the built-in `edit`,
-never instead of it, so the two engines can be A/B tested in one session (deviations
-ledger #1).
+same teaching errors, same model-facing diff. It **replaces** the built-in `edit` tool
+(withdrawn via `exposure: "hidden"` re-registration at load time), so `patch` is the
+sole editing tool. (deviations ledger #1 revised: side-by-side coexistence retired.)
 
 The factual reference is [docs/EDIT-TOOL-ANALYSIS.md](docs/EDIT-TOOL-ANALYSIS.md)
 (hermes `patch` vs pi `edit` — what each tool does and why). [docs/PLAN.md](docs/PLAN.md) is
@@ -21,7 +21,7 @@ the README's comparison table summarizes the intent.
 **This repo dogfoods the extension**: on this box `pi` loads `src/index.ts` for every
 session via the global packages entry `../../pi-patch/src/index.ts` in
 `~/.pi/agent/settings.json` (a machine-local install pointing at this repo's source), so
-agents have `patch` available by default (alongside `edit`). There is deliberately **no**
+agents have `patch` available by default (in place of `edit`). There is deliberately **no**
 project-level `.pi/extensions` loader: it would register the same tool under a second
 extension path, and pi's resource loader reports that as a `Tool "patch" conflicts with …`
 startup error. To dogfood from a fresh clone, add the same packages entry — or run
@@ -30,14 +30,10 @@ see the dogfooding policy below.
 
 ## Dogfooding policy — `patch` is the daily driver
 
-Both `patch` and `edit` stay operational at all times (that coexistence is the point —
-deviations ledger #1). When working in this repo, treat **`patch` as your default tool for
-file edits** and `edit` as the fallback:
+`patch` is the sole editing tool (`edit` is withdrawn by this extension). When working in
+this repo, use **`patch`** for all file edits. The `write` tool is still available for
+creating new files.
 
-- **Reach for `edit` only when you must finish work that `patch` can't do** — e.g. a
-  suspected tool bug — multi-hunk/multi-file edits go through `mode:"patch"` (V4A)
-  when it is advertised. Switching is always allowed; never let a `patch` failure
-  block the task.
 - **If `patch` fails or misbehaves — wrong match, wrong shaping, spurious ambiguity,
   unhelpful error, render glitch — log it** in [docs/DOGFOOD.md](docs/DOGFOOD.md): what you
   attempted, the error or wrong result verbatim, expected vs actual, and the strategy you

@@ -1,8 +1,7 @@
 /**
  * pi-patch — a pi extension registering a `patch` tool: an exact port of
- * hermes' `patch` tool, alongside the built-in `edit` tool (never instead of
- * it, so devs can A/B the two matching engines in one session without
- * hindering abilities; deviations ledger #1).
+ * hermes' `patch` tool, replacing the built-in `edit` tool (withdrawn via
+ * `exposure: "hidden"` re-registration; deviations ledger #1 revised).
  *
  * Schema layering (Tier 3 #9, pi's analog of hermes'
  * `dynamic_schema_overrides`): the tool registers with hermes' base
@@ -35,6 +34,7 @@
  * ~/.pi/agent/extensions/pi-patch (pi loads directories with an index.ts).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { shouldAdvertiseV4A, type ModelIdentity } from "./gate.js";
 import { guidanceModelId } from "./edit-guidance.js";
 import { createPatchToolDefinition, resolveToCwd } from "./tool.js";
@@ -42,6 +42,24 @@ import { noteRead, noteWrite, stampForToolResult } from "./staleness.js";
 import { patchRenderers } from "./render.js";
 
 export default function piPatchExtension(pi: ExtensionAPI) {
+	// Withdraw the built-in `edit` tool. Re-registering with `exposure: "hidden"`
+	// makes the tool unreachable: the model can't see or call it, even via
+	// `--tools +edit` or `defaultTools` settings. pi-patch's `patch` tool
+	// supersedes `edit` with hermes' 9-strategy tolerant matching.
+	//
+	// To restore A/B coexistence, delete this block (deviations ledger #1
+	// originally mandated side-by-side; this retires that obligation).
+	pi.registerTool({
+		name: "edit",
+		label: "Edit",
+		description: "Disabled by pi-patch; use the patch tool instead.",
+		parameters: Type.Object({}),
+		execute: async () => {
+			throw new Error("The edit tool is disabled by the pi-patch extension. Use the patch tool instead.");
+		},
+		exposure: "hidden",
+	});
+
 	const register = (state: { advertiseV4A: boolean; modelId?: string }) =>
 		pi.registerTool({
 			...createPatchToolDefinition(process.cwd(), state),
